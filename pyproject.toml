@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serviceflow"
+version = "0.1.0"
+description = "Phase 1 raw realtime voice loop for ServiceFlow"
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    "livekit-agents==1.8.3",
+    "livekit-plugins-silero==1.8.3",
+    "python-dotenv>=1.1,<2",
+]
+
+[project.scripts]
+serviceflow-agent = "agent.main:run"
+
+[tool.setuptools]
+packages = ["agent"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
