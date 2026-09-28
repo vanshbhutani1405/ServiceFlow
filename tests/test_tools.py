@@ -12,6 +12,7 @@ from db.tools import (
     check_technician_availability,
     get_customer_context,
     get_job,
+    dispatch_job,
     reschedule_appointment,
 )
 
@@ -78,8 +79,8 @@ class FakeClient:
     def __init__(self, *, conflict=False):
         self.conflict = conflict
         self.tables = {
-            "customers": [{"id": CUSTOMER_ID, "full_name": "Maya", "phone": "1"}],
-            "jobs": [{"id": JOB_ID, "customer_id": CUSTOMER_ID, "status": "open"}],
+            "customers": [{"id": CUSTOMER_ID, "full_name": "Maya", "phone": "1", "service_area": "sf"}],
+            "jobs": [{"id": JOB_ID, "customer_id": CUSTOMER_ID, "service_type": "hvac", "status": "open"}],
             "technicians": [{"id": TECHNICIAN_ID, "full_name": "Jordan", "skills": ["hvac"], "service_areas": ["sf"], "status": "active"}],
             "technician_availability": [{"id": "window-1", "technician_id": TECHNICIAN_ID, "available_start": "2026-10-01T09:00:00+00:00", "available_end": "2026-10-01T17:00:00+00:00", "status": "available"}],
             "appointments": ([{"id": "conflict", "customer_id": CUSTOMER_ID, "job_id": JOB_ID, "technician_id": TECHNICIAN_ID, "scheduled_start": "2026-10-01T10:30:00+00:00", "scheduled_end": "2026-10-01T11:30:00+00:00", "status": "confirmed"}] if conflict else []),
@@ -148,4 +149,24 @@ def test_database_failure_is_not_success():
     result = run(get_job(JOB_ID, client=BrokenClient()))
     assert result.status == "failure"
     assert not result.ok
+
+
+def test_dispatch_selects_and_persists_deterministic_technician():
+    client = FakeClient()
+    client.tables["appointments"].append({
+        "id": APPOINTMENT_ID, "customer_id": CUSTOMER_ID, "job_id": JOB_ID,
+        "technician_id": None, "scheduled_start": START.isoformat(),
+        "scheduled_end": END.isoformat(), "status": "confirmed",
+    })
+    result = run(dispatch_job(JOB_ID, customer_id=CUSTOMER_ID, client=client))
+    assert result.ok
+    assert result.data["technician"]["id"] == TECHNICIAN_ID
+    assert client.tables["jobs"][0]["status"] == "dispatched"
+    assert client.tables["jobs"][0]["technician_id"] == TECHNICIAN_ID
+    assert client.tables["appointments"][0]["status"] == "dispatched"
+
+
+def test_dispatch_rejects_wrong_customer():
+    result = run(dispatch_job(JOB_ID, customer_id="another-customer", client=FakeClient()))
+    assert result.status == "not_found"
 

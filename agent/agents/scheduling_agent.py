@@ -10,6 +10,7 @@ from typing import Any
 from livekit.agents import Agent, RunContext, function_tool
 
 from agent.routing import SchedulingIntent, route_request
+from agent.agents.dispatch_agent import DispatchAgent
 from db import tools as db_tools
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ You are ServiceFlow's friendly scheduling receptionist.
 Today is {today}. Keep replies concise, natural, and conversational.
 
 Handle only appointment booking, availability, rescheduling, cancellation,
+dispatch,
 and returning-customer appointment context. Use the database tools whenever
 customer, job, appointment, technician, availability, or confirmation data is
 needed. Ask for genuinely missing information instead of guessing.
@@ -56,7 +58,8 @@ request as appropriate. Never expose internal tool names or statuses.
 For a new booking, collect service type, service area, job/customer context,
 and an ISO-8601 date/time with timezone before calling the booking tool. The
 booking workflow will only proceed when the database exposes exactly one
-eligible technician; do not rank technicians yourself.
+eligible technician; do not rank technicians yourself. For a dispatch request,
+handoff to the dispatch coordinator so matching remains deterministic.
 """.strip(),
         )
 
@@ -70,6 +73,18 @@ eligible technician; do not rank technicians yourself.
                 "Follow the scheduling instructions and use tools as needed."
             ),
         )
+
+    @function_tool()
+    async def transfer_to_dispatch(
+        self, context: RunContext, job_id: str, scheduled_start: str,
+        scheduled_end: str, service_type: str = "", service_area: str = "",
+    ) -> tuple[DispatchAgent, str]:
+        """Hand a concrete dispatch request to the deterministic dispatch workflow."""
+        return DispatchAgent(
+            customer_id=self.customer_id, db_client=self.db_client, job_id=job_id,
+            scheduled_start=scheduled_start, scheduled_end=scheduled_end,
+            chat_ctx=self.chat_ctx.copy(exclude_instructions=True),
+        ), "I’ll check which technician is available for that job."
 
     def _missing_customer(self) -> db_tools.ToolResult:
         return db_tools.ToolResult(

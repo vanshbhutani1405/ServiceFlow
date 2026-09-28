@@ -38,11 +38,14 @@ create table if not exists jobs (
     service_type text not null,
     description text not null,
     address text not null,
+    technician_id uuid references technicians(id) on delete set null,
     priority text not null default 'normal' check (priority in ('low', 'normal', 'high', 'emergency')),
     status text not null default 'open' check (status in ('open', 'scheduled', 'dispatched', 'in_progress', 'completed', 'cancelled')),
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
+
+alter table jobs add column if not exists technician_id uuid references technicians(id) on delete set null;
 
 create table if not exists appointments (
     id uuid primary key default gen_random_uuid(),
@@ -95,6 +98,7 @@ create table if not exists appointment_events (
 );
 
 create index if not exists idx_jobs_customer_id on jobs(customer_id);
+create index if not exists idx_jobs_technician_id on jobs(technician_id);
 create index if not exists idx_appointments_customer_id on appointments(customer_id);
 create index if not exists idx_appointments_job_id on appointments(job_id);
 create index if not exists idx_appointments_technician_window on appointments(technician_id, scheduled_start, scheduled_end);

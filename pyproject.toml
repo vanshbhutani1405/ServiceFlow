@@ -24,7 +24,7 @@ test = [
 serviceflow-agent = "agent.main:run"
 
 [tool.setuptools]
-packages = ["agent", "db"]
+packages = ["agent", "agent.agents", "agent.matching", "db"]
 
 [tool.ruff]
 line-length = 100

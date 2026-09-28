@@ -11,6 +11,7 @@ class SchedulingIntent(str, Enum):
     RESCHEDULE = "RESCHEDULE"
     CANCEL = "CANCEL"
     GENERAL_SCHEDULING = "GENERAL_SCHEDULING"
+    DISPATCH = "DISPATCH"
     UNKNOWN = "UNKNOWN"
 
 
@@ -19,6 +20,8 @@ def route_request(text: str) -> SchedulingIntent:
     normalized = text.casefold()
     if re.search(r"\b(cancel|call off|no longer need)\b", normalized):
         return SchedulingIntent.CANCEL
+    if re.search(r"\b(dispatch|assign|send a technician|send someone out)\b", normalized):
+        return SchedulingIntent.DISPATCH
     if re.search(r"\b(reschedule|re[- ]?schedule|move|change|different time|different day)\b", normalized):
         return SchedulingIntent.RESCHEDULE
     if re.search(r"\b(availability|available|opening|openings|appointment time|when can)\b", normalized):

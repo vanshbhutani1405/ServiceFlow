@@ -15,6 +15,11 @@ from typing import Any, Literal
 
 from supabase import Client
 
+from agent.matching.technician_matcher import (
+    JobRequirements,
+    TechnicianCandidate,
+    match_technician,
+)
 from db.supabase_client import get_supabase_client
 
 logger = logging.getLogger(__name__)
@@ -252,17 +257,115 @@ async def cancel_appointment(
         return _failure("cancel_appointment", exc)
 
 
-async def dispatch_job(job_id: str, *, technician_id: str | None = None, client: Client | None = None) -> ToolResult:
+async def match_technician_for_job(
+    job_id: str,
+    scheduled_start: datetime,
+    scheduled_end: datetime,
+    *,
+    customer_id: str | None = None,
+    service_type: str | None = None,
+    service_area: str | None = None,
+    client: Client | None = None,
+) -> ToolResult:
+    """Find and deterministically select an eligible technician for a job."""
     try:
         db = _client(client)
         job = await _one(db, "jobs", job_id)
         if not job:
             return ToolResult("not_found", error="Job not found")
-        if technician_id and not await _one(db, "technicians", technician_id):
-            return ToolResult("not_found", error="Technician not found")
-        patch = {"status": "dispatched"}
+        if customer_id is not None and job.get("customer_id") != customer_id:
+            return ToolResult("not_found", error="Job not found for customer")
+        customer = await _one(db, "customers", job["customer_id"])
+        if not customer:
+            return ToolResult("not_found", error="Customer not found")
+        requested_type = service_type or job.get("service_type")
+        requested_area = service_area or customer.get("service_area")
+        if not requested_type or not requested_area:
+            return ToolResult("failure", error="Job service type and customer service area are required")
+
+        technicians = await _many(db.from_("technicians").select("*"))
+        candidates: list[TechnicianCandidate] = []
+        for row in technicians:
+            availability = await check_technician_availability(
+                row["id"], scheduled_start, scheduled_end, client=db
+            )
+            workload_rows = await _many(
+                db.from_("appointments")
+                .select("id")
+                .eq("technician_id", row["id"])
+                .in_("status", ["requested", "confirmed", "rescheduled", "dispatched"])
+            )
+            candidates.append(TechnicianCandidate(
+                id=row["id"], full_name=row.get("full_name", ""), status=row.get("status", ""),
+                skills=tuple(row.get("skills") or ()), service_areas=tuple(row.get("service_areas") or ()),
+                available=availability.ok and bool(availability.data.get("available")),
+                workload=len(workload_rows),
+                distance_minutes=row.get("distance_minutes"), eta_minutes=row.get("eta_minutes"),
+            ))
+        decision = match_technician(JobRequirements(requested_type, requested_area, scheduled_start, scheduled_end), candidates)
+        data = {
+            "technician": decision.technician.__dict__ if decision.technician else None,
+            "eligible_candidates": [candidate.__dict__ for candidate in decision.eligible_candidates],
+            "explanation": list(decision.explanation),
+        }
+        return ToolResult(decision.status, data=data, error=decision.error)
+    except Exception as exc:
+        return _failure("match_technician_for_job", exc)
+
+
+async def dispatch_job(
+    job_id: str,
+    *,
+    technician_id: str | None = None,
+    customer_id: str | None = None,
+    scheduled_start: datetime | None = None,
+    scheduled_end: datetime | None = None,
+    service_type: str | None = None,
+    service_area: str | None = None,
+    client: Client | None = None,
+) -> ToolResult:
+    """Assign a job through deterministic matching and persist dispatch state."""
+    try:
+        db = _client(client)
+        job = await _one(db, "jobs", job_id)
+        if not job:
+            return ToolResult("not_found", error="Job not found")
+        if customer_id is not None and job.get("customer_id") != customer_id:
+            return ToolResult("not_found", error="Job not found for customer")
+        appointments = await _many(db.from_("appointments").select("*").eq("job_id", job_id))
+        appointment = appointments[0] if appointments else None
+        if scheduled_start is None and appointment:
+            scheduled_start = datetime.fromisoformat(str(appointment["scheduled_start"]).replace("Z", "+00:00"))
+        if scheduled_end is None and appointment:
+            scheduled_end = datetime.fromisoformat(str(appointment["scheduled_end"]).replace("Z", "+00:00"))
+        if scheduled_start is None or scheduled_end is None:
+            return ToolResult("failure", error="A scheduled appointment window is required for dispatch")
+        match = await match_technician_for_job(
+            job_id, scheduled_start, scheduled_end, customer_id=customer_id,
+            service_type=service_type, service_area=service_area, client=db,
+        )
+        if not match.ok:
+            return match
+        selected = match.data["technician"]
+        if technician_id is not None and technician_id != selected["id"]:
+            return ToolResult("unavailable", data=match.data, error="Requested technician is not the deterministic match")
+        technician_id = selected["id"]
+        patch = {"status": "dispatched", "technician_id": technician_id}
         response = await _execute(db.from_("jobs").update(patch).eq("id", job_id).select("*").single())
-        return ToolResult("success", response.data)
+        if appointment:
+            await _execute(db.from_("appointments").update({
+                "technician_id": technician_id, "status": "dispatched",
+            }).eq("id", appointment["id"]))
+            await _execute(db.from_("appointment_events").insert({
+                "appointment_id": appointment["id"], "event_type": "dispatched",
+                "metadata": {"technician_id": technician_id, "explanation": match.data["explanation"]},
+            }))
+        await _execute(db.from_("tool_executions").insert({
+            "tool_name": "dispatch_job", "status": "success",
+            "input": {"job_id": job_id, "technician_id": technician_id},
+            "output": response.data,
+        }))
+        return ToolResult("success", {"job": response.data, "technician": selected, "explanation": match.data["explanation"]})
     except Exception as exc:
         return _failure("dispatch_job", exc)
 
