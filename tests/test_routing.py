@@ -1,4 +1,5 @@
 from agent.routing import SchedulingIntent, route_request
+from agent.routing import is_flexible_availability_request
 from agent.agents.scheduling_agent import SchedulingAgent
 from agent.state import WorkflowState
 from types import SimpleNamespace
@@ -21,4 +22,10 @@ def test_unknown_intake_answer_does_not_reset_active_booking_workflow():
     asyncio.run(agent.on_user_turn_completed(None, SimpleNamespace(text_content="San Francisco")))
 
     assert agent.state.active_workflow == SchedulingIntent.BOOK.value
+
+
+def test_flexible_availability_phrases_are_detected_deterministically():
+    assert is_flexible_availability_request("Any day is fine")
+    assert is_flexible_availability_request("What's the next available?")
+    assert route_request("What dates are available?") == SchedulingIntent.GENERAL_SCHEDULING
 

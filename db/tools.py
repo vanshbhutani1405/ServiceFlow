@@ -11,7 +11,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from supabase import Client
@@ -238,10 +238,11 @@ async def find_best_technician(
     try:
         db = _client(client)
         technicians = await _many(db.from_("technicians").select("*").eq("status", "active"))
+        requested_area = _area_key(service_area)
         candidates = [
             tech for tech in technicians
-            if service_area in (tech.get("service_areas") or [])
-            and service_type in (tech.get("skills") or [])
+            if requested_area in {_area_key(str(area)) for area in (tech.get("service_areas") or [])}
+            and service_type.casefold() in {str(skill).casefold() for skill in (tech.get("skills") or [])}
         ]
         available = []
         for technician in candidates:
@@ -253,6 +254,119 @@ async def find_best_technician(
         return ToolResult("success", {"candidates": available, "matching_deferred": True})
     except Exception as exc:
         return _failure("find_best_technician", exc)
+
+
+def _parse_db_datetime(value: Any) -> datetime:
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _area_key(value: str) -> str:
+    return value.casefold().replace(" ", "_").replace("-", "_")
+
+
+async def find_next_available_slots(
+    service_area: str,
+    service_type: str,
+    *,
+    service_duration_minutes: int = 60,
+    search_start: datetime | None = None,
+    search_horizon_days: int = 7,
+    preferred_start_time: str | None = None,
+    preferred_end_time: str | None = None,
+    preferred_days: list[int] | None = None,
+    client: Client | None = None,
+) -> ToolResult:
+    """Search real future technician availability and return deterministic slots."""
+    if service_duration_minutes <= 0 or search_horizon_days <= 0:
+        return ToolResult("failure", error="Service duration and search horizon must be positive")
+    try:
+        db = _client(client)
+        start = search_start or datetime.now(timezone.utc)
+        start = _parse_db_datetime(start)
+        horizon_end = start + timedelta(days=search_horizon_days)
+        technicians = await _many(db.from_("technicians").select("*").eq("status", "active"))
+        availability = await _many(db.from_("technician_availability").select("*").eq("status", "available"))
+        appointments = await _many(
+            db.from_("appointments").select("*").in_(
+                "status", ["requested", "confirmed", "rescheduled", "dispatched"]
+            )
+        )
+        blocking = [
+            row for row in appointments
+            if row.get("technician_id") and row.get("scheduled_start") and row.get("scheduled_end")
+        ]
+        duration = timedelta(minutes=service_duration_minutes)
+        area = _area_key(service_area)
+        skill = service_type.casefold().strip()
+        slots: list[dict[str, Any]] = []
+
+        for technician in technicians:
+            tech_areas = {_area_key(str(item)) for item in (technician.get("service_areas") or [])}
+            tech_skills = {str(item).casefold() for item in (technician.get("skills") or [])}
+            if area not in tech_areas or skill not in tech_skills:
+                continue
+            windows = [
+                row for row in availability
+                if row.get("technician_id") == technician.get("id")
+            ]
+            for window in windows:
+                window_start = max(_parse_db_datetime(window["available_start"]), start)
+                window_end = min(_parse_db_datetime(window["available_end"]), horizon_end)
+                candidate = window_start.replace(second=0, microsecond=0)
+                minute = ((candidate.minute + 29) // 30) * 30
+                if minute >= 60:
+                    candidate = candidate.replace(minute=0) + timedelta(hours=1)
+                else:
+                    candidate = candidate.replace(minute=minute)
+                while candidate + duration <= window_end:
+                    if preferred_days is not None and candidate.weekday() not in preferred_days:
+                        candidate += timedelta(minutes=30)
+                        continue
+                    if preferred_start_time and candidate.strftime("%H:%M") < preferred_start_time:
+                        candidate += timedelta(minutes=30)
+                        continue
+                    candidate_end = candidate + duration
+                    if preferred_end_time and candidate_end.strftime("%H:%M") > preferred_end_time:
+                        candidate += timedelta(minutes=30)
+                        continue
+                    conflict = False
+                    for appointment in blocking:
+                        if appointment["technician_id"] != technician.get("id"):
+                            continue
+                        existing_start = _parse_db_datetime(appointment["scheduled_start"])
+                        existing_end = _parse_db_datetime(appointment["scheduled_end"])
+                        if existing_start < candidate_end and existing_end > candidate:
+                            conflict = True
+                            logger.info(
+                                "availability_conflict technician_id=%s start=%s end=%s",
+                                technician.get("id"), candidate.isoformat(), candidate_end.isoformat(),
+                            )
+                            break
+                    if not conflict:
+                        slot = {
+                            "slot_id": f"{technician['id']}:{candidate.isoformat()}",
+                            "start": candidate.isoformat(),
+                            "end": candidate_end.isoformat(),
+                            "technician_id": technician["id"],
+                        }
+                        slots.append(slot)
+                        logger.info(
+                            "availability_candidate technician_id=%s start=%s end=%s",
+                            technician["id"], slot["start"], slot["end"],
+                        )
+                    candidate += timedelta(minutes=30)
+        slots.sort(key=lambda slot: (slot["start"], slot["technician_id"]))
+        slots = slots[:5]
+        status = "success" if slots else "unavailable"
+        logger.info(
+            "availability_search status=%s mode=FLEXIBLE horizon=%s slots_found=%s",
+            status, search_horizon_days, len(slots),
+        )
+        return ToolResult(status, {"slots": slots, "search_horizon_days": search_horizon_days},
+                          None if slots else "No eligible technician slots were found")
+    except Exception as exc:
+        return _failure("find_next_available_slots", exc)
 
 
 async def book_appointment(
@@ -380,8 +494,8 @@ async def match_technician_for_job(
         customer = await _one(db, "customers", job["customer_id"])
         if not customer:
             return ToolResult("not_found", error="Customer not found")
-        requested_type = service_type or job.get("service_type")
-        requested_area = service_area or customer.get("service_area")
+        requested_type = (service_type or job.get("service_type") or "").casefold()
+        requested_area = _area_key(service_area or customer.get("service_area") or "")
         if not requested_type or not requested_area:
             return ToolResult("failure", error="Job service type and customer service area are required")
 
@@ -399,7 +513,8 @@ async def match_technician_for_job(
             )
             candidates.append(TechnicianCandidate(
                 id=row["id"], full_name=row.get("full_name", ""), status=row.get("status", ""),
-                skills=tuple(row.get("skills") or ()), service_areas=tuple(row.get("service_areas") or ()),
+                skills=tuple(str(skill).casefold() for skill in (row.get("skills") or ())),
+                service_areas=tuple(_area_key(str(area)) for area in (row.get("service_areas") or ())),
                 available=availability.ok and bool(availability.data.get("available")),
                 workload=len(workload_rows),
                 distance_minutes=row.get("distance_minutes"), eta_minutes=row.get("eta_minutes"),

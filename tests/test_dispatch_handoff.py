@@ -223,6 +223,63 @@ def test_transfer_syncs_tool_name_and_completes_canonical_workflow(monkeypatch):
     assert calls == ["customer", "job", ("dispatch", JOB_ID)]
 
 
+def test_select_available_slot_accepts_only_backend_candidate():
+    agent = make_agent()
+    state = WorkflowState(
+        service_type="hvac", service_area="sf",
+        candidate_slots=[{
+            "slot_id": "tech-1:2026-10-01T10:00:00+00:00",
+            "start": "2026-10-01T10:00:00+00:00",
+            "end": "2026-10-01T11:00:00+00:00",
+            "technician_id": "tech-1",
+        }],
+    )
+    agent.state = state
+    selected = json.loads(run(agent.select_available_slot(
+        ToolContext(state), slot_id="tech-1:2026-10-01T10:00:00+00:00"
+    )))
+    assert selected["status"] == "success"
+    assert state.selected_technician_id == "tech-1"
+    assert state.scheduled_start.endswith("10:00:00+00:00")
+    with pytest.raises(ToolError):
+        run(agent.select_available_slot(ToolContext(state), slot_id="invented"))
+
+
+def test_selected_flexible_slot_flows_into_dispatch(monkeypatch):
+    agent = make_agent()
+    state = WorkflowState(
+        service_type="hvac", service_area="sf", address="1 Main Street",
+        full_name="Maya Chen", phone="4155550100",
+        scheduled_start="2026-10-01T10:00:00+00:00",
+        scheduled_end="2026-10-01T11:00:00+00:00",
+        selected_technician_id="tech-1",
+        job_id=JOB_ID,
+    )
+    agent.state = state
+    captured = {}
+
+    async def context(_self):
+        return db_tools.ToolResult("success", {
+            "customer": {"id": "customer-1", "full_name": "Maya Chen", "phone": "4155550100"},
+            "jobs": [{"id": JOB_ID, "customer_id": "customer-1"}], "appointments": [],
+        })
+
+    async def get_job(_job_id, **_kwargs):
+        return db_tools.ToolResult("success", {"id": JOB_ID, "customer_id": "customer-1"})
+
+    async def dispatch(job_id, **kwargs):
+        captured.update(job_id=job_id, **kwargs)
+        return db_tools.ToolResult("success", {"job": {"id": JOB_ID, "technician_id": "tech-1"}})
+
+    monkeypatch.setattr(SchedulingAgent, "_get_customer_context", context)
+    monkeypatch.setattr(db_tools, "get_job", get_job)
+    monkeypatch.setattr(db_tools, "dispatch_job", dispatch)
+    result = json.loads(run(agent.transfer_to_dispatch(ToolContext(state), JOB_ID)))
+    assert result["status"] == "success"
+    assert captured["job_id"] == JOB_ID
+    assert captured["technician_id"] == "tech-1"
+
+
 def test_job_creation_failure_prevents_dispatch(monkeypatch):
     agent = make_agent()
     agent.customer_id = None

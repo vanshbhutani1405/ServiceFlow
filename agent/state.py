@@ -21,6 +21,9 @@ class WorkflowState:
     dispatch_status: str = "not_started"
     active_workflow: str | None = None
     workflow_stage: str = "INTAKE"
+    availability_mode: str = "EXACT"
+    candidate_slots: list[dict] | None = None
+    selected_technician_id: str | None = None
 
     def next_missing_field(self) -> str | None:
         ordered = (

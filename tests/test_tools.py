@@ -14,6 +14,7 @@ from db.tools import (
     get_job,
     dispatch_job,
     create_job,
+    find_next_available_slots,
     resolve_or_create_customer,
     get_job_status,
     reschedule_appointment,
@@ -171,6 +172,24 @@ def test_dispatch_retry_reuses_persisted_assignment():
     result = run(dispatch_job(JOB_ID, customer_id=CUSTOMER_ID, client=client))
     assert result.ok
     assert result.data["job"]["technician_id"] == TECHNICIAN_ID
+
+
+def test_flexible_search_returns_real_slots_from_availability_and_skips_conflicts():
+    client = FakeClient(conflict=True)
+    result = run(find_next_available_slots(
+        "sf", "hvac", search_start=START, search_horizon_days=2, client=client,
+    ))
+    assert result.ok
+    assert result.data["slots"]
+    assert all(slot["technician_id"] == TECHNICIAN_ID for slot in result.data["slots"])
+    assert all(slot["start"].startswith("2026-10-01T") for slot in result.data["slots"])
+    assert all(slot["start"] != START.isoformat() for slot in result.data["slots"])
+
+
+def test_flexible_search_returns_unavailable_without_matching_technician():
+    result = run(find_next_available_slots("sf", "electrical", search_start=START, client=FakeClient()))
+    assert result.status == "unavailable"
+    assert result.data["slots"] == []
 
 
 def test_dispatch_rejects_wrong_customer():

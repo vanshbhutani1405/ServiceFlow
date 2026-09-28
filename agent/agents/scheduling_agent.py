@@ -13,7 +13,7 @@ from livekit.agents.llm import ToolError
 
 from agent.agents.triage_agent import TriageAgent
 from agent.recovery import run_with_recovery
-from agent.routing import SchedulingIntent, route_request
+from agent.routing import SchedulingIntent, is_flexible_availability_request, route_request
 from agent.safety.classifier import SAFETY_RESPONSE, SafetyStatus
 from agent.state import WorkflowState
 from db import tools as db_tools
@@ -125,7 +125,13 @@ synchronously and wait for its actual result before reporting assignment.
             return
         intent = route_request(new_message.text_content)
         active = getattr(self.state, "active_workflow", None)
-        if active == SchedulingIntent.BOOK.value and intent not in {
+        flexible = is_flexible_availability_request(new_message.text_content)
+        if flexible:
+            self.state.active_workflow = SchedulingIntent.BOOK.value
+            self.state.availability_mode = "FLEXIBLE"
+            self.state.workflow_stage = "CHECKING_AVAILABILITY"
+            intent = SchedulingIntent.BOOK
+        elif active == SchedulingIntent.BOOK.value and intent not in {
             SchedulingIntent.CANCEL, SchedulingIntent.RESCHEDULE,
         }:
             intent = SchedulingIntent.BOOK
@@ -177,11 +183,12 @@ synchronously and wait for its actual result before reporting assignment.
         logger.info("dispatch_validation status=success customer_id=%s job_id=%s", self.customer_id, resolved_job_id)
         self.state.job_id = resolved_job_id
         self.state.dispatch_status = "attempted"
-        self.state.workflow_stage = "DISPATCH"
+        self.state.workflow_stage = "DISPATCHING"
         self._sync_state()
         try:
             dispatch_result = await db_tools.dispatch_job(
                 resolved_job_id,
+                technician_id=self.state.selected_technician_id,
                 customer_id=self.state.customer_id,
                 scheduled_start=_parse_time(self.state.scheduled_start or ""),
                 scheduled_end=_parse_time(self.state.scheduled_end or ""),
@@ -265,6 +272,65 @@ synchronously and wait for its actual result before reporting assignment.
             "question": f"What is your {next_field}?" if next_field else "All required information is collected.",
             "state": self.state.__dict__,
         })
+
+    @function_tool()
+    async def find_next_available_slots(
+        self, context: RunContext, service_duration_minutes: int = 60,
+        search_start: str = "", search_horizon_days: int = 7,
+    ) -> str:
+        """Return only database-backed future slots for a flexible request."""
+        self._bind_state(context)
+        if context is not None:
+            context.disallow_interruptions()
+        if not self.state.service_type or not self.state.service_area:
+            raise ToolError("Please provide the service type and service area before checking availability")
+        try:
+            start = _parse_time(search_start) if search_start else datetime.now(timezone.utc)
+        except ValueError as exc:
+            raise ToolError(f"Invalid availability search start: {exc}") from exc
+        self.state.availability_mode = "FLEXIBLE"
+        self.state.workflow_stage = "CHECKING_AVAILABILITY"
+        result = await db_tools.find_next_available_slots(
+            self.state.service_area, self.state.service_type,
+            service_duration_minutes=service_duration_minutes,
+            search_start=start, search_horizon_days=search_horizon_days,
+            client=self.db_client,
+        )
+        if result.ok:
+            self.state.candidate_slots = list(result.data.get("slots", []))
+            self.state.workflow_stage = "SELECTING_SLOT"
+        if not result.ok:
+            raise ToolError(result.error or "No eligible technician slots were found")
+        return _json(_result(result))
+
+    @function_tool()
+    async def select_available_slot(
+        self, context: RunContext, slot_id: str = "",
+        scheduled_start: str = "", scheduled_end: str = "", technician_id: str = "",
+    ) -> str:
+        """Select only one of the previously returned backend slots."""
+        self._bind_state(context)
+        if context is not None:
+            context.disallow_interruptions()
+        slots = self.state.candidate_slots or []
+        selected = next((slot for slot in slots if slot.get("slot_id") == slot_id), None)
+        if selected is None and scheduled_start and scheduled_end and technician_id:
+            selected = next((slot for slot in slots if (
+                slot.get("start") == scheduled_start and slot.get("end") == scheduled_end
+                and slot.get("technician_id") == technician_id
+            )), None)
+        if selected is None:
+            raise ToolError("Please choose one of the available appointment options")
+        self.state.scheduled_start = selected["start"]
+        self.state.scheduled_end = selected["end"]
+        self.state.selected_technician_id = selected["technician_id"]
+        self.state.availability_mode = "FLEXIBLE"
+        self.state.workflow_stage = "DISPATCHING"
+        logger.info(
+            "availability_selection status=success technician_id=%s start=%s end=%s",
+            selected["technician_id"], selected["start"], selected["end"],
+        )
+        return _json({"status": "success", "selected_slot": selected})
 
     def _missing_customer(self) -> db_tools.ToolResult:
         return db_tools.ToolResult(
