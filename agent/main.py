@@ -12,7 +12,14 @@ from typing import Any
 
 from dotenv import load_dotenv
 from livekit import agents
-from livekit.agents import Agent, AgentSession, TurnHandlingOptions, inference
+from livekit.agents import (
+    Agent,
+    AgentServer,
+    AgentSession,
+    TurnHandlingOptions,
+    cli,
+    inference,
+)
 from livekit.plugins import silero
 
 load_dotenv()
@@ -59,6 +66,10 @@ def _log_session_metrics(session: AgentSession) -> None:
             )
 
 
+server = AgentServer()
+
+
+@server.rtc_session()
 async def entrypoint(ctx: agents.JobContext) -> None:
     await ctx.connect()
 
@@ -102,7 +113,7 @@ def run() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
+    cli.run_app(server)
 
 
 if __name__ == "__main__":
