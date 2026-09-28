@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "serviceflow"
 version = "0.1.0"
-description = "Phase 1 raw realtime voice loop for ServiceFlow"
+description = "Low-latency voice agent and scheduling workflow for ServiceFlow"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
 dependencies = [

@@ -1,40 +1,28 @@
-"""Minimal Phase 1 ServiceFlow voice agent.
-
-The business workflow is intentionally absent here. This module only proves
-the streaming LiveKit Inference STT -> LLM -> TTS loop and records the
-latencies exposed by the AgentSession conversation history.
-"""
+"""ServiceFlow LiveKit agent entrypoint."""
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from dotenv import load_dotenv
 from livekit import agents
 from livekit.agents import (
-    Agent,
     AgentServer,
     AgentSession,
     TurnHandlingOptions,
     cli,
     inference,
+    room_io,
 )
 from livekit.plugins import silero
+
+from agent.agents.scheduling_agent import SchedulingAgent
 
 load_dotenv()
 
 logger = logging.getLogger("serviceflow")
-
-SYSTEM_INSTRUCTIONS = """
-You are a friendly, concise receptionist for a home-service company.
-Answer naturally and keep replies brief for a voice conversation.
-This is a voice-pipeline demonstration: do not book, reschedule, or cancel
-anything; do not call business tools; and do not invent customer, service,
-technician, or appointment information. If asked to take an action, explain
-that this demo can only answer general questions and offer to take a message.
-""".strip()
-
 
 def _metric_value(metrics: Any, name: str) -> float | None:
     value = getattr(metrics, name, None)
@@ -73,9 +61,29 @@ server = AgentServer()
 async def entrypoint(ctx: agents.JobContext) -> None:
     await ctx.connect()
 
+    vad = silero.VAD.load()
+    stt = inference.STT(model="deepgram/nova-3", language="multi")
+
+    @vad.on("metrics_collected")
+    def on_vad_metrics(metrics: Any) -> None:
+        logger.info(
+            "voice_input vad_metrics inference_count=%s inference_duration_s=%s",
+            getattr(metrics, "inference_count", None),
+            getattr(metrics, "inference_duration_total", None),
+        )
+
+    @stt.on("metrics_collected")
+    def on_stt_metrics(metrics: Any) -> None:
+        logger.info(
+            "voice_input stt_metrics audio_duration_s=%s streamed=%s duration_s=%s",
+            getattr(metrics, "audio_duration", None),
+            getattr(metrics, "streamed", None),
+            getattr(metrics, "duration", None),
+        )
+
     session = AgentSession(
-        vad=silero.VAD.load(),
-        stt=inference.STT(model="deepgram/nova-3", language="multi"),
+        vad=vad,
+        stt=stt,
         llm=inference.LLM(model="google/gemma-4-31b-it"),
         tts=inference.TTS(
             model="fishaudio/s2.1-pro",
@@ -92,19 +100,58 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             },
             preemptive_generation={"preemptive_tts": True},
         ),
+        transcription_timeout=5.0,
     )
+
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed(event: Any) -> None:
+        logger.info(
+            "voice_input transcript=%r final=%s language=%s",
+            getattr(event, "transcript", None),
+            getattr(event, "is_final", None),
+            getattr(event, "language", None),
+        )
+
+    @session.on("user_transcription_timeout")
+    def on_user_transcription_timeout(event: Any) -> None:
+        logger.warning(
+            "voice_input transcription_timeout speech_duration_s=%s vad_speech_started_at=%s",
+            getattr(event, "speech_duration", None),
+            getattr(event, "vad_speech_started_at", None),
+        )
+
+    @session.on("user_state_changed")
+    def on_user_state_changed(event: Any) -> None:
+        logger.info(
+            "voice_input user_state old=%s new=%s",
+            getattr(event, "old_state", None),
+            getattr(event, "new_state", None),
+        )
+
+    @session.on("error")
+    def on_session_error(event: Any) -> None:
+        logger.error("voice_input session_error=%s", event)
 
     async def on_session_end() -> None:
         _log_session_metrics(session)
 
     ctx.add_shutdown_callback(on_session_end)
 
+    agent = SchedulingAgent(customer_id=os.getenv("SERVICEFLOW_CUSTOMER_ID"))
     await session.start(
-        agent=Agent(instructions=SYSTEM_INSTRUCTIONS),
+        agent=agent,
         room=ctx.room,
+        room_options=room_io.RoomOptions(audio_input=True, audio_output=True),
+    )
+    linked_participant = session.room_io.linked_participant
+    logger.info(
+        "voice_input ready audio_enabled=%s audio_source=%s linked_participant=%s",
+        session.input.audio_enabled,
+        type(session.input.audio).__name__ if session.input.audio is not None else None,
+        linked_participant.identity if linked_participant is not None else None,
     )
     await session.generate_reply(
-        instructions="Greet the caller briefly and say you are ready to help with general questions."
+        instructions="Greet the caller briefly and ask whether they need to book, reschedule, or cancel an appointment."
     )
 
 

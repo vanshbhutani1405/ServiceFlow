@@ -9,8 +9,8 @@ The agent demonstrates:
 
 `customer speech -> LiveKit -> AgentSession -> streaming STT -> LLM -> streaming TTS -> response audio`
 
-No scheduling, database, dispatch, triage, dashboard, Langfuse, or deployment
-code belongs in this phase.
+Dispatch, triage, dashboard, Langfuse, and deployment remain out of scope for
+the current MVP.
 
 Phase 2 adds the Supabase schema and independently callable internal database
 tools under `db/`. Those tools are not wired into the voice conversation yet.

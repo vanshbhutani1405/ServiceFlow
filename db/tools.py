@@ -193,6 +193,7 @@ async def reschedule_appointment(
     scheduled_start: datetime,
     scheduled_end: datetime,
     *,
+    customer_id: str | None = None,
     client: Client | None = None,
 ) -> ToolResult:
     try:
@@ -200,6 +201,8 @@ async def reschedule_appointment(
         appointment = await _one(db, "appointments", appointment_id)
         if not appointment:
             return ToolResult("not_found", error="Appointment not found")
+        if customer_id is not None and appointment.get("customer_id") != customer_id:
+            return ToolResult("not_found", error="Appointment not found for customer")
         if appointment.get("status") in {"cancelled", "completed"}:
             return ToolResult("failure", error=f"Cannot reschedule appointment in {appointment['status']} state")
         availability = await check_technician_availability(
@@ -222,12 +225,19 @@ async def reschedule_appointment(
         return _failure("reschedule_appointment", exc)
 
 
-async def cancel_appointment(appointment_id: str, *, client: Client | None = None) -> ToolResult:
+async def cancel_appointment(
+    appointment_id: str,
+    *,
+    customer_id: str | None = None,
+    client: Client | None = None,
+) -> ToolResult:
     try:
         db = _client(client)
         appointment = await _one(db, "appointments", appointment_id)
         if not appointment:
             return ToolResult("not_found", error="Appointment not found")
+        if customer_id is not None and appointment.get("customer_id") != customer_id:
+            return ToolResult("not_found", error="Appointment not found for customer")
         if appointment.get("status") == "cancelled":
             return ToolResult("failure", error="Appointment is already cancelled")
         if appointment.get("status") == "completed":
