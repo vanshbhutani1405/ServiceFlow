@@ -9,7 +9,15 @@ def requirements() -> JobRequirements:
 
 
 def technician(identifier: str, **kwargs) -> TechnicianCandidate:
-    return TechnicianCandidate(identifier, identifier, "active", ("hvac",), ("north",), **kwargs)
+    values = {
+        "id": identifier,
+        "full_name": identifier,
+        "status": "active",
+        "skills": ("hvac",),
+        "service_areas": ("north",),
+    }
+    values.update(kwargs)
+    return TechnicianCandidate(**values)
 
 
 def test_hard_constraints_exclude_ineligible_technicians():
