@@ -12,6 +12,9 @@ The agent demonstrates:
 No scheduling, database, dispatch, triage, dashboard, Langfuse, or deployment
 code belongs in this phase.
 
+Phase 2 adds the Supabase schema and independently callable internal database
+tools under `db/`. Those tools are not wired into the voice conversation yet.
+
 ## Requirements
 
 - Python 3.10 through 3.14
@@ -36,6 +39,22 @@ Fill in the three LiveKit values in `.env`. Download the VAD model files once:
 
 ```powershell
 python -m agent.main download-files
+```
+
+For Phase 2, also set `SUPABASE_URL` and the server-side
+`SUPABASE_SERVICE_ROLE_KEY` in `.env`. Run `db/schema.sql` in the Supabase SQL
+Editor, then seed deterministic MVP fixtures with:
+
+```powershell
+python -m db.seed
+```
+
+The database tools are available from `db.tools` and return explicit
+`success`, `failure`, `not_found`, or `unavailable` results. Run their focused
+unit tests with:
+
+```powershell
+python -m pytest
 ```
 
 ## Run locally

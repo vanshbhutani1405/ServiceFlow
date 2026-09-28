@@ -12,13 +12,19 @@ dependencies = [
     "livekit-agents==1.8.3",
     "livekit-plugins-silero==1.8.3",
     "python-dotenv>=1.1,<2",
+    "supabase>=2.18,<3",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8,<9",
 ]
 
 [project.scripts]
 serviceflow-agent = "agent.main:run"
 
 [tool.setuptools]
-packages = ["agent"]
+packages = ["agent", "db"]
 
 [tool.ruff]
 line-length = 100
