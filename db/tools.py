@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -56,6 +57,20 @@ async def _many(query: Any) -> list[dict[str, Any]]:
     return list(response.data or [])
 
 
+async def _execute_one(query: Any) -> dict[str, Any] | None:
+    """Execute a returning query and safely take its first returned row.
+
+    The installed PostgREST 2.31 query builder has no ``single()`` method.
+    Supabase mutations with ``select`` return rows through ``execute()``.
+    """
+    rows = await _many(query)
+    return rows[0] if rows else None
+
+
+def _normalize_phone(phone: str) -> str:
+    return re.sub(r"[^\d+]", "", phone.strip())
+
+
 def _failure(tool_name: str, exc: Exception) -> ToolResult:
     logger.exception("database_tool_failed tool=%s", tool_name)
     return ToolResult("failure", error=str(exc))
@@ -74,12 +89,96 @@ async def get_customer_context(customer_id: str, *, client: Client | None = None
         return _failure("get_customer_context", exc)
 
 
+async def resolve_or_create_customer(
+    full_name: str,
+    phone: str,
+    *,
+    address: str | None = None,
+    client: Client | None = None,
+) -> ToolResult:
+    """Resolve a customer by phone or create one with a database-generated UUID."""
+    normalized_phone = _normalize_phone(phone)
+    if not full_name.strip() or len("".join(char for char in normalized_phone if char.isdigit())) < 7:
+        return ToolResult("failure", error="A full name and valid phone number are required")
+    try:
+        db = _client(client)
+        matches = await _many(db.from_("customers").select("*").eq("phone", normalized_phone).limit(1))
+        if matches:
+            return ToolResult("success", {"customer": matches[0], "created": False})
+        customer = await _execute_one(db.from_("customers").insert({
+            "full_name": full_name.strip(), "phone": normalized_phone, "address": address,
+        }).select("*"))
+        if not customer or not customer.get("id"):
+            return ToolResult("failure", error="Customer creation returned no database ID")
+        return ToolResult("success", {"customer": customer, "created": True})
+    except Exception as exc:
+        return _failure("resolve_or_create_customer", exc)
+
+
 async def get_job(job_id: str, *, client: Client | None = None) -> ToolResult:
     try:
         job = await _one(_client(client), "jobs", job_id)
         return ToolResult("success", job) if job else ToolResult("not_found", error="Job not found")
     except Exception as exc:
         return _failure("get_job", exc)
+
+
+async def create_job(
+    customer_id: str,
+    service_type: str,
+    description: str,
+    address: str,
+    *,
+    priority: str = "normal",
+    client: Client | None = None,
+) -> ToolResult:
+    """Create a new job and return the database-generated canonical UUID."""
+    if not service_type.strip() or not description.strip() or not address.strip():
+        return ToolResult("failure", error="service_type, description, and address are required")
+    try:
+        db = _client(client)
+        if not await _one(db, "customers", customer_id):
+            return ToolResult("not_found", error="Customer not found")
+        job = await _execute_one(db.from_("jobs").insert({
+            "customer_id": customer_id,
+            "service_type": service_type.strip(),
+            "description": description.strip(),
+            "address": address.strip(),
+            "priority": priority,
+            "status": "open",
+        }).select("*"))
+        if not job or not job.get("id"):
+            return ToolResult("failure", error="Job creation returned no database ID")
+        return ToolResult("success", job)
+    except Exception as exc:
+        return _failure("create_job", exc)
+
+
+async def get_job_status(
+    job_id: str,
+    *,
+    customer_id: str | None = None,
+    client: Client | None = None,
+) -> ToolResult:
+    """Return authoritative job/appointment state for status questions."""
+    try:
+        db = _client(client)
+        job = await _one(db, "jobs", job_id)
+        if not job:
+            return ToolResult("not_found", error="Job not found")
+        if customer_id is not None and job.get("customer_id") != customer_id:
+            return ToolResult("not_found", error="Job not found for customer")
+        appointments = await _many(db.from_("appointments").select("*").eq("job_id", job_id))
+        appointment = appointments[0] if appointments else None
+        if appointment and appointment.get("status") in {"confirmed", "rescheduled", "dispatched"}:
+            state = "appointment_confirmed" if appointment.get("status") != "dispatched" else "technician_assigned"
+        elif job.get("status") == "dispatched":
+            state = "job_dispatched"
+        else:
+            state = "job_created"
+        return ToolResult("success", {"state": state, "job": job, "appointment": appointment})
+    except Exception as exc:
+        return _failure("get_job_status", exc)
 
 
 async def check_technician_availability(
@@ -178,12 +277,13 @@ async def book_appointment(
         availability = await check_technician_availability(technician_id, scheduled_start, scheduled_end, client=db)
         if not availability.ok:
             return availability
-        response = await _execute(db.from_("appointments").insert({
+        appointment = await _execute_one(db.from_("appointments").insert({
             "customer_id": customer_id, "job_id": job_id, "technician_id": technician_id,
             "scheduled_start": scheduled_start.isoformat(), "scheduled_end": scheduled_end.isoformat(),
             "status": "confirmed", "notes": notes,
-        }).select("*").single())
-        appointment = response.data
+        }).select("*"))
+        if not appointment or not appointment.get("id"):
+            return ToolResult("failure", error="Appointment creation returned no database ID")
         await _execute(db.from_("jobs").update({"status": "scheduled"}).eq("id", job_id))
         await _execute(db.from_("appointment_events").insert({
             "appointment_id": appointment["id"], "event_type": "booked", "metadata": {},
@@ -216,12 +316,13 @@ async def reschedule_appointment(
         )
         if not availability.ok:
             return availability
-        response = await _execute(db.from_("appointments").update({
+        updated = await _execute_one(db.from_("appointments").update({
             "scheduled_start": scheduled_start.isoformat(),
             "scheduled_end": scheduled_end.isoformat(),
             "status": "rescheduled",
-        }).eq("id", appointment_id).select("*").single())
-        updated = response.data
+        }).eq("id", appointment_id).select("*"))
+        if not updated:
+            return ToolResult("failure", error="Reschedule returned no database row")
         await _execute(db.from_("appointment_events").insert({
             "appointment_id": appointment_id, "event_type": "rescheduled", "metadata": {},
         }))
@@ -247,8 +348,9 @@ async def cancel_appointment(
             return ToolResult("failure", error="Appointment is already cancelled")
         if appointment.get("status") == "completed":
             return ToolResult("failure", error="Cannot cancel a completed appointment")
-        response = await _execute(db.from_("appointments").update({"status": "cancelled"}).eq("id", appointment_id).select("*").single())
-        updated = response.data
+        updated = await _execute_one(db.from_("appointments").update({"status": "cancelled"}).eq("id", appointment_id).select("*"))
+        if not updated:
+            return ToolResult("failure", error="Cancellation returned no database row")
         await _execute(db.from_("appointment_events").insert({
             "appointment_id": appointment_id, "event_type": "cancelled", "metadata": {},
         }))
@@ -303,6 +405,10 @@ async def match_technician_for_job(
                 distance_minutes=row.get("distance_minutes"), eta_minutes=row.get("eta_minutes"),
             ))
         decision = match_technician(JobRequirements(requested_type, requested_area, scheduled_start, scheduled_end), candidates)
+        logger.info(
+            "technician_matching status=%s technician_id=%s",
+            decision.status, decision.technician.id if decision.technician else None,
+        )
         data = {
             "technician": decision.technician.__dict__ if decision.technician else None,
             "eligible_candidates": [candidate.__dict__ for candidate in decision.eligible_candidates],
@@ -332,6 +438,14 @@ async def dispatch_job(
             return ToolResult("not_found", error="Job not found")
         if customer_id is not None and job.get("customer_id") != customer_id:
             return ToolResult("not_found", error="Job not found for customer")
+        if job.get("status") == "dispatched" and job.get("technician_id"):
+            technician = await _one(db, "technicians", job["technician_id"])
+            if technician is None:
+                return ToolResult("failure", error="Dispatched job has no persisted technician record")
+            logger.info("dispatch status=existing job_id=%s technician_id=%s", job_id, job["technician_id"])
+            return ToolResult("success", {
+                "job": job, "technician": technician, "explanation": ["Existing dispatch reused"],
+            })
         appointments = await _many(db.from_("appointments").select("*").eq("job_id", job_id))
         appointment = appointments[0] if appointments else None
         if scheduled_start is None and appointment:
@@ -351,7 +465,11 @@ async def dispatch_job(
             return ToolResult("unavailable", data=match.data, error="Requested technician is not the deterministic match")
         technician_id = selected["id"]
         patch = {"status": "dispatched", "technician_id": technician_id}
-        response = await _execute(db.from_("jobs").update(patch).eq("id", job_id).select("*").single())
+        updated_job = await _execute_one(db.from_("jobs").update(patch).eq("id", job_id).select("*"))
+        if not updated_job or updated_job.get("id") != job_id or updated_job.get("technician_id") != technician_id:
+            logger.warning("technician_assignment status=failure job_id=%s technician_id=%s", job_id, technician_id)
+            return ToolResult("failure", error="Technician assignment was not persisted")
+        logger.info("technician_assignment status=success job_id=%s technician_id=%s", job_id, technician_id)
         if appointment:
             await _execute(db.from_("appointments").update({
                 "technician_id": technician_id, "status": "dispatched",
@@ -363,9 +481,9 @@ async def dispatch_job(
         await _execute(db.from_("tool_executions").insert({
             "tool_name": "dispatch_job", "status": "success",
             "input": {"job_id": job_id, "technician_id": technician_id},
-            "output": response.data,
+            "output": updated_job,
         }))
-        return ToolResult("success", {"job": response.data, "technician": selected, "explanation": match.data["explanation"]})
+        return ToolResult("success", {"job": updated_job, "technician": selected, "explanation": match.data["explanation"]})
     except Exception as exc:
         return _failure("dispatch_job", exc)
 
@@ -381,12 +499,12 @@ async def send_confirmation(
         db = _client(client)
         if not await _one(db, "appointments", appointment_id):
             return ToolResult("not_found", error="Appointment not found")
-        response = await _execute(db.from_("appointment_events").insert({
+        event = await _execute_one(db.from_("appointment_events").insert({
             "appointment_id": appointment_id,
             "event_type": "confirmation_recorded",
             "metadata": {"channel": channel, "message": message},
-        }).select("*").single())
-        return ToolResult("success", response.data)
+        }).select("*"))
+        return ToolResult("success", event) if event else ToolResult("failure", error="Confirmation event was not recorded")
     except Exception as exc:
         return _failure("send_confirmation", exc)
 

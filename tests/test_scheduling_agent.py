@@ -7,6 +7,8 @@ import pytest
 pytest.importorskip("livekit.agents")
 
 from agent.agents.scheduling_agent import SchedulingAgent
+from agent.agents.scheduling_agent import _normalize_datetime
+from agent.state import WorkflowState
 from db import tools as db_tools
 
 
@@ -89,6 +91,64 @@ def test_failed_booking_is_not_confirmed(monkeypatch):
     ))
     assert result.status == "failure"
     assert not confirmation_called
+
+
+@pytest.mark.parametrize(
+    "start,end",
+    [
+        ("2026-10-01T10:00:00Z", "2026-10-01T11:00:00"),
+        ("2026-10-01T10:00:00+00:00", "2026-10-01T11:00:00+00:00"),
+    ],
+)
+def test_datetime_normalization_accepts_supported_iso_values(start, end):
+    assert _normalize_datetime(start) < _normalize_datetime(end)
+
+
+def test_datetime_normalization_rejects_invalid_value():
+    with pytest.raises(ValueError):
+        _normalize_datetime("tomorrow afternoon")
+
+
+def test_record_intake_merges_phone_fragments_and_preserves_valid_value():
+    agent = make_agent()
+    agent.state = WorkflowState()
+    agent._merge_intake(phone="seven eight eight eight")
+    agent._merge_intake(phone="45123689")
+    assert agent.state.phone == "788845123689"
+    agent._merge_intake(phone="")
+    assert agent.state.phone == "788845123689"
+
+
+def test_record_intake_merges_datetime_before_validation():
+    agent = make_agent()
+    agent.state = WorkflowState()
+    agent._merge_intake(
+        service_type="hvac", service_area="San Francisco",
+        scheduled_start="2026-10-01T10:00:00Z",
+        scheduled_end="2026-10-01T11:00:00Z",
+        address="1 Main Street", full_name="Maya Chen", phone="4155550100",
+    )
+    assert agent.state.scheduled_start == "2026-10-01T10:00:00+00:00"
+    assert agent.state.scheduled_end == "2026-10-01T11:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    "start,end,expected",
+    [
+        ("", "2026-10-01T11:00:00Z", "requested date and time window"),
+        ("2026-10-01T10:00:00Z", "", "requested date and time window"),
+        ("2026-10-01T11:00:00Z", "2026-10-01T10:00:00Z", "valid requested time window"),
+    ],
+)
+def test_dispatch_validation_rejects_incomplete_or_invalid_time_window(start, end, expected):
+    agent = make_agent()
+    agent.state = WorkflowState()
+    result = run(agent._validate_dispatch_prerequisites(
+        service_type="hvac", service_area="San Francisco", scheduled_start=start,
+        scheduled_end=end, address="1 Main Street", full_name="Maya Chen", phone="4155550100",
+    ))
+    assert result.status == "failure"
+    assert expected in (result.error or "")
 
 
 def test_reschedule_not_found_is_not_confirmed(monkeypatch):

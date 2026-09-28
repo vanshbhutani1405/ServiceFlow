@@ -19,6 +19,7 @@ from livekit.agents import (
 from livekit.plugins import silero
 
 from agent.agents.scheduling_agent import SchedulingAgent
+from agent.state import WorkflowState
 
 load_dotenv()
 
@@ -81,7 +82,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             getattr(metrics, "duration", None),
         )
 
+    workflow_state = WorkflowState(customer_id=os.getenv("SERVICEFLOW_CUSTOMER_ID") or None)
     session = AgentSession(
+        userdata=workflow_state,
         vad=vad,
         stt=stt,
         llm=inference.LLM(model="google/gemma-4-31b-it"),
@@ -128,6 +131,18 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             getattr(event, "new_state", None),
         )
 
+    @session.on("agent_state_changed")
+    def on_agent_state_changed(event: Any) -> None:
+        logger.info(
+            "barge_in agent_state old=%s new=%s",
+            getattr(event, "old_state", None),
+            getattr(event, "new_state", None),
+        )
+
+    @session.on("agent_false_interruption")
+    def on_agent_false_interruption(event: Any) -> None:
+        logger.info("barge_in false_interruption resumed=%s", getattr(event, "resumed", None))
+
     @session.on("error")
     def on_session_error(event: Any) -> None:
         logger.error("voice_input session_error=%s", event)
@@ -137,7 +152,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     ctx.add_shutdown_callback(on_session_end)
 
-    agent = SchedulingAgent(customer_id=os.getenv("SERVICEFLOW_CUSTOMER_ID"))
+    agent = SchedulingAgent(customer_id=workflow_state.customer_id, state=workflow_state)
     await session.start(
         agent=agent,
         room=ctx.room,

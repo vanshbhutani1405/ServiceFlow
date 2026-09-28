@@ -13,6 +13,9 @@ from db.tools import (
     get_customer_context,
     get_job,
     dispatch_job,
+    create_job,
+    resolve_or_create_customer,
+    get_job_status,
     reschedule_appointment,
 )
 
@@ -30,7 +33,6 @@ class FakeQuery:
         self.client, self.table = client, table
         self.filters = []
         self.operation, self.payload = "select", None
-        self.single_row = False
 
     def select(self, *_args): return self
     def eq(self, key, value): self.filters.append((key, "eq", value)); return self
@@ -41,7 +43,6 @@ class FakeQuery:
     def gte(self, key, value): self.filters.append((key, "gte", value)); return self
     def order(self, *_args, **_kwargs): return self
     def limit(self, *_args): return self
-    def single(self): self.single_row = True; return self
     def insert(self, payload): self.operation, self.payload = "insert", payload; return self
     def update(self, payload): self.operation, self.payload = "update", payload; return self
 
@@ -59,8 +60,6 @@ class FakeQuery:
             for row in rows:
                 if self._matches(row): row.update(deepcopy(self.payload))
             selected = [deepcopy(row) for row in rows if self._matches(row)]
-        if self.single_row:
-            return SimpleNamespace(data=selected[0] if selected else None)
         return SimpleNamespace(data=selected)
 
     def _matches(self, row):
@@ -79,7 +78,7 @@ class FakeClient:
     def __init__(self, *, conflict=False):
         self.conflict = conflict
         self.tables = {
-            "customers": [{"id": CUSTOMER_ID, "full_name": "Maya", "phone": "1", "service_area": "sf"}],
+            "customers": [{"id": CUSTOMER_ID, "full_name": "Maya Chen", "phone": "4155550100", "service_area": "sf"}],
             "jobs": [{"id": JOB_ID, "customer_id": CUSTOMER_ID, "service_type": "hvac", "status": "open"}],
             "technicians": [{"id": TECHNICIAN_ID, "full_name": "Jordan", "skills": ["hvac"], "service_areas": ["sf"], "status": "active"}],
             "technician_availability": [{"id": "window-1", "technician_id": TECHNICIAN_ID, "available_start": "2026-10-01T09:00:00+00:00", "available_end": "2026-10-01T17:00:00+00:00", "status": "available"}],
@@ -166,7 +165,76 @@ def test_dispatch_selects_and_persists_deterministic_technician():
     assert client.tables["appointments"][0]["status"] == "dispatched"
 
 
+def test_dispatch_retry_reuses_persisted_assignment():
+    client = FakeClient()
+    client.tables["jobs"][0].update({"status": "dispatched", "technician_id": TECHNICIAN_ID})
+    result = run(dispatch_job(JOB_ID, customer_id=CUSTOMER_ID, client=client))
+    assert result.ok
+    assert result.data["job"]["technician_id"] == TECHNICIAN_ID
+
+
 def test_dispatch_rejects_wrong_customer():
     result = run(dispatch_job(JOB_ID, customer_id="another-customer", client=FakeClient()))
     assert result.status == "not_found"
+
+
+def test_dispatch_rejects_invalid_or_missing_job_id():
+    client = FakeClient()
+    assert run(dispatch_job("job_alan_1234567", client=client)).status == "not_found"
+    assert run(dispatch_job("", client=client)).status == "not_found"
+
+
+def test_create_job_returns_database_generated_id():
+    client = FakeClient()
+    result = run(create_job(
+        CUSTOMER_ID, "hvac", "AC repair", "1 Main St", client=client
+    ))
+    assert result.ok
+    assert result.data["id"]
+    assert result.data["customer_id"] == CUSTOMER_ID
+
+
+def test_resolve_or_create_customer_reuses_existing_customer():
+    client = FakeClient()
+    result = run(resolve_or_create_customer("Maya Chen", "4155550100", client=client))
+    assert result.ok
+    assert result.data["customer"]["id"] == CUSTOMER_ID
+    assert result.data["created"] is False
+
+
+def test_resolve_or_create_customer_creates_real_customer_id():
+    client = FakeClient()
+    result = run(resolve_or_create_customer("Alex Rivera", "4155550199", client=client))
+    assert result.ok
+    assert result.data["created"] is True
+    assert result.data["customer"]["id"]
+
+
+def test_resolve_or_create_customer_normalizes_phone_before_lookup_and_insert():
+    client = FakeClient()
+    result = run(resolve_or_create_customer("Alex Rivera", "+1 (415) 555-0199", client=client))
+    assert result.ok
+    assert result.data["customer"]["phone"] == "+14155550199"
+
+
+def test_resolve_or_create_customer_lookup_failure_is_not_success():
+    class BrokenCustomerClient:
+        def from_(self, table):
+            if table == "customers":
+                raise RuntimeError("customer lookup unavailable")
+            raise AssertionError(f"unexpected table: {table}")
+
+    result = run(resolve_or_create_customer("Alex Rivera", "4155550199", client=BrokenCustomerClient()))
+    assert result.status == "failure"
+    assert "customer lookup unavailable" in (result.error or "")
+
+
+def test_job_status_reports_backend_state():
+    client = FakeClient()
+    result = run(get_job_status(JOB_ID, customer_id=CUSTOMER_ID, client=client))
+    assert result.ok
+    assert result.data["state"] == "job_created"
+    client.tables["jobs"][0].update({"status": "dispatched", "technician_id": TECHNICIAN_ID})
+    result = run(get_job_status(JOB_ID, customer_id=CUSTOMER_ID, client=client))
+    assert result.data["state"] == "job_dispatched"
 
