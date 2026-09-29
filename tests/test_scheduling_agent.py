@@ -7,7 +7,7 @@ import pytest
 pytest.importorskip("livekit.agents")
 
 from agent.agents.scheduling_agent import SchedulingAgent
-from agent.agents.scheduling_agent import _effective_service_duration, _normalize_datetime
+from agent.agents.scheduling_agent import _effective_service_duration, _normalize_datetime, _requested_window_from_text
 from agent.state import WorkflowState
 from db import tools as db_tools
 
@@ -136,6 +136,81 @@ def test_record_intake_merges_datetime_before_validation():
     )
     assert agent.state.scheduled_start == "2026-10-01T10:00:00+00:00"
     assert agent.state.scheduled_end == "2026-10-01T11:00:00+00:00"
+
+
+@pytest.mark.parametrize("phrase,window", [
+    ("tomorrow morning", ("08:00", "12:00")),
+    ("tomorrow afternoon", ("12:00", "17:00")),
+    ("tomorrow evening", ("17:00", "21:00")),
+    ("tomorrow", None),
+])
+def test_relative_date_preserves_time_window_constraint(phrase, window):
+    parsed = _requested_window_from_text(phrase)
+    assert parsed is not None
+    requested_date, time_window = parsed
+    assert requested_date
+    assert time_window == (None if window is None else phrase.split()[-1])
+
+
+def test_customer_intake_progresses_name_then_phone_then_address():
+    agent = make_agent()
+    agent.state = WorkflowState(
+        service_type="hvac", service_area="sf", requested_date="2026-09-30",
+        requested_time_window="morning",
+    )
+    name = run(agent.record_intake(None, full_name="John Smith"))
+    assert '"next_field": "phone number"' in name
+    phone = run(agent.record_intake(None, phone="9876543210"))
+    assert '"next_field": "full service address"' in phone
+    address = run(agent.record_intake(None, address="123 Main Street"))
+    assert '"next_field": null' in address
+
+
+def test_flexible_search_passes_canonical_requested_date_and_window(monkeypatch):
+    agent = make_agent()
+    agent.state = WorkflowState(
+        service_type="hvac", service_area="sf", requested_date="2026-09-30",
+        requested_time_window="morning", requested_window_start="08:00",
+        requested_window_end="12:00",
+    )
+    captured = {}
+
+    async def search(service_area, service_type, **kwargs):
+        captured.update(service_area=service_area, service_type=service_type, **kwargs)
+        return db_tools.ToolResult("success", {"slots": [{"slot_id": "morning-slot"}]})
+
+    monkeypatch.setattr(db_tools, "find_next_available_slots", search)
+    result = run(agent.find_next_available_slots(None))
+    assert '"status": "success"' in result
+    assert captured["search_start"].isoformat() == "2026-09-30T00:00:00+00:00"
+    assert captured["search_horizon_days"] == 1
+    assert captured["preferred_start_time"] == "08:00"
+    assert captured["preferred_end_time"] == "12:00"
+
+
+def test_unavailable_requested_window_returns_same_day_alternatives(monkeypatch):
+    agent = make_agent()
+    agent.state = WorkflowState(
+        service_type="hvac", service_area="sf", requested_date="2026-09-30",
+        requested_time_window="morning", requested_window_start="08:00",
+        requested_window_end="12:00",
+    )
+    calls = []
+
+    async def search(_area, _service, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("preferred_start_time"):
+            return db_tools.ToolResult("unavailable", error="No morning slots")
+        return db_tools.ToolResult("success", {"slots": [{
+            "slot_id": "afternoon-slot", "start": "2026-09-30T13:00:00+00:00",
+            "end": "2026-09-30T14:00:00+00:00", "technician_id": "tech-1",
+        }]})
+
+    monkeypatch.setattr(db_tools, "find_next_available_slots", search)
+    result = run(agent.find_next_available_slots(None))
+    assert '"status": "unavailable"' in result
+    assert agent.state.candidate_slots[0]["slot_id"] == "afternoon-slot"
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize(

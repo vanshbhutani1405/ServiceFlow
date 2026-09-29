@@ -14,6 +14,10 @@ class WorkflowState:
     service_area: str | None = None
     address: str | None = None
     description: str | None = None
+    requested_date: str | None = None
+    requested_time_window: str | None = None
+    requested_window_start: str | None = None
+    requested_window_end: str | None = None
     scheduled_start: str | None = None
     scheduled_end: str | None = None
     job_id: str | None = None
@@ -33,10 +37,10 @@ class WorkflowState:
         ordered = (
             ("service type", self.service_type),
             ("service area", self.service_area),
-            ("requested date", self.scheduled_start),
-            ("requested time window", self.scheduled_end),
-            ("full service address", self.address),
+            ("requested date", self.requested_date or self.scheduled_start),
+            ("requested time window", self.requested_time_window or self.scheduled_end),
             ("full name", self.full_name),
             ("phone number", self.phone),
+            ("full service address", self.address),
         )
         return next((name for name, value in ordered if not value), None)

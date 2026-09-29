@@ -6,7 +6,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from livekit.agents import Agent, RunContext, function_tool
@@ -26,6 +26,11 @@ _PHONE_WORDS = {
     "zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3",
     "four": "4", "five": "5", "six": "6", "seven": "7", "eight": "8",
     "nine": "9",
+}
+_TIME_WINDOWS = {
+    "morning": ("08:00", "12:00"),
+    "afternoon": ("12:00", "17:00"),
+    "evening": ("17:00", "21:00"),
 }
 
 
@@ -84,6 +89,24 @@ def _effective_service_duration(service_type: str, requested: int, description: 
     return 60
 
 
+def _requested_window_from_text(text: str) -> tuple[str, str | None] | None:
+    """Extract only explicit relative-date/time-window constraints from speech."""
+    normalized = text.casefold()
+    if "tomorrow" not in normalized:
+        return None
+    requested_date = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
+    for name in _TIME_WINDOWS:
+        if re.search(rf"\b{name}\b", normalized):
+            return requested_date, name
+    return requested_date, None
+
+
+def _normalize_requested_date(value: str) -> str:
+    if value.casefold().strip() == "tomorrow":
+        return (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
+    return value.strip()
+
+
 class SchedulingAgent(Agent):
     """Focused receptionist for booking, rescheduling, and cancellation."""
 
@@ -119,7 +142,7 @@ the tool result has status "success". For "unavailable", "not_found", or
 request as appropriate. Never expose internal tool names or statuses.
 
 For a new booking, collect service type, service area, requested date/time,
-full street address, full customer name, and phone before handing off a new
+full customer name, phone, and then the full street address before handing off a new
 request. The handoff resolves or creates the customer, creates the job first,
 and captures its returned database ID; never invent or substitute an ID. The
 booking workflow will only proceed when the database exposes exactly one
@@ -132,6 +155,14 @@ before a flexible slot has been selected.
         )
 
     async def on_user_turn_completed(self, turn_ctx: Any, new_message: Any) -> None:
+        requested_window = _requested_window_from_text(new_message.text_content)
+        if requested_window:
+            requested_date, time_window = requested_window
+            self.state.requested_date = requested_date
+            self.state.requested_time_window = time_window
+            if time_window:
+                self.state.requested_window_start, self.state.requested_window_end = _TIME_WINDOWS[time_window]
+            self.state.availability_mode = "FLEXIBLE"
         safety = TriageAgent.classify(new_message.text_content)
         if safety.status == SafetyStatus.EMERGENCY_ESCALATION:
             self._safety_escalated = True
@@ -144,7 +175,7 @@ before a flexible slot has been selected.
         if flexible:
             self.state.active_workflow = SchedulingIntent.BOOK.value
             self.state.availability_mode = "FLEXIBLE"
-            self.state.workflow_stage = "CHECKING_AVAILABILITY"
+            self.state.workflow_stage = "CHECKING_AVAILABILITY" if not self.state.next_missing_field() else "INTAKE"
             intent = SchedulingIntent.BOOK
         elif active == SchedulingIntent.BOOK.value and intent not in {
             SchedulingIntent.CANCEL, SchedulingIntent.RESCHEDULE,
@@ -206,6 +237,8 @@ before a flexible slot has been selected.
         self.state.dispatch_status = "attempted"
         self.state.workflow_stage = "DISPATCHING"
         self._sync_state()
+        self._announce_progress(context, "Great, I'm just assigning the technician now.", "dispatch")
+        dispatch_started = time.perf_counter()
         try:
             dispatch_result = await db_tools.dispatch_job(
                 resolved_job_id,
@@ -223,8 +256,9 @@ before a flexible slot has been selected.
         self.state.booking_status = "dispatched" if dispatch_result.ok else "failed"
         self.state.workflow_stage = "COMPLETE" if dispatch_result.ok else "FAILED"
         logger.info(
-            "dispatch_result status=%s customer_id=%s job_id=%s error=%s",
+            "dispatch_result status=%s customer_id=%s job_id=%s error=%s duration_ms=%.1f",
             dispatch_result.status, self.state.customer_id, resolved_job_id, dispatch_result.error,
+            (time.perf_counter() - dispatch_started) * 1000,
         )
         if not dispatch_result.ok:
             raise ToolError(dispatch_result.error or "The service request could not be dispatched")
@@ -274,10 +308,25 @@ before a flexible slot has been selected.
         self._customer_phone = self.state.phone
         self._last_job_id = self.state.job_id
 
+    def _announce_progress(self, context: RunContext | None, message: str, operation: str) -> None:
+        """Start short progress speech before a potentially slow tool operation."""
+        started = time.perf_counter()
+        logger.info("acknowledgement_start operation=%s", operation)
+        session = getattr(context, "session", None) if context is not None else None
+        if session is not None:
+            session.say(message, allow_interruptions=True, add_to_chat_ctx=False)
+        elif context is not None and hasattr(context, "update"):
+            context.update(message)
+        logger.info(
+            "tool_start operation=%s acknowledgement_to_tool_ms=%.1f",
+            operation, (time.perf_counter() - started) * 1000,
+        )
+
     @function_tool()
     async def record_intake(
         self, context: RunContext, service_type: str = "", service_area: str = "",
-        scheduled_start: str = "", scheduled_end: str = "", address: str = "",
+        scheduled_start: str = "", scheduled_end: str = "", requested_date: str = "",
+        time_window: str = "", address: str = "",
         description: str = "", full_name: str = "", phone: str = "",
     ) -> str:
         """Store supplied intake fields and return exactly the next field to ask for."""
@@ -287,6 +336,13 @@ before a flexible slot has been selected.
             scheduled_start=scheduled_start, scheduled_end=scheduled_end,
             address=address, description=description, full_name=full_name, phone=phone,
         )
+        if requested_date:
+            self.state.requested_date = _normalize_requested_date(requested_date)
+        if time_window:
+            normalized_window = time_window.casefold().strip()
+            if normalized_window in _TIME_WINDOWS:
+                self.state.requested_time_window = normalized_window
+                self.state.requested_window_start, self.state.requested_window_end = _TIME_WINDOWS[normalized_window]
         next_field = self.state.next_missing_field()
         return _json({
             "status": "success", "next_field": next_field,
@@ -318,17 +374,46 @@ before a flexible slot has been selected.
                 self.state.service_type, requested_duration, duration,
             )
         try:
-            start = _parse_time(search_start) if search_start else datetime.now(timezone.utc)
+            if search_start:
+                start = _parse_time(search_start)
+            elif self.state.requested_date:
+                start = _parse_time(f"{self.state.requested_date}T00:00:00+00:00")
+            else:
+                start = datetime.now(timezone.utc)
         except ValueError as exc:
             raise ToolError(f"Invalid availability search start: {exc}") from exc
         self.state.availability_mode = "FLEXIBLE"
         self.state.workflow_stage = "CHECKING_AVAILABILITY"
+        if self.state.requested_date and not search_start and search_horizon_days == 7:
+            search_horizon_days = 1
+        self._announce_progress(context, "Sure, one moment while I check availability.", "availability")
+        tool_started = time.perf_counter()
         result = await db_tools.find_next_available_slots(
             self.state.service_area, self.state.service_type,
             service_duration_minutes=duration,
             search_start=start, search_horizon_days=search_horizon_days,
+            preferred_start_time=self.state.requested_window_start,
+            preferred_end_time=self.state.requested_window_end,
             client=self.db_client,
         )
+        logger.info("tool_end operation=availability tool_duration_ms=%.1f", (time.perf_counter() - tool_started) * 1000)
+        if not result.ok and self.state.requested_time_window:
+            alternatives = await db_tools.find_next_available_slots(
+                self.state.service_area, self.state.service_type,
+                service_duration_minutes=duration, search_start=start, search_horizon_days=1,
+                client=self.db_client,
+            )
+            if alternatives.ok and alternatives.data.get("slots"):
+                self.state.candidate_slots = list(alternatives.data["slots"])
+                self.state.workflow_stage = "SELECTING_SLOT"
+                return _json({
+                    "status": "unavailable", "data": {
+                        "requested_date": self.state.requested_date,
+                        "requested_time_window": self.state.requested_time_window,
+                        "slots": [], "alternatives": self.state.candidate_slots,
+                    },
+                    "error": f"No {self.state.requested_time_window} slots are available; alternatives are available later that day.",
+                })
         if result.ok:
             self.state.candidate_slots = list(result.data.get("slots", []))
             self.state.workflow_stage = "SELECTING_SLOT"
@@ -336,7 +421,7 @@ before a flexible slot has been selected.
             raise ToolError(result.error or "No eligible technician slots were found")
         return _json(_result(result))
 
-    async def _finalize_selected_slot(self) -> db_tools.ToolResult:
+    async def _finalize_selected_slot(self, context: RunContext | None = None) -> db_tools.ToolResult:
         """Recheck and persist a selected backend slot without another LLM call."""
         selected_technician = self.state.selected_technician_id
         selected_slot_id = self.state.selected_slot_id
@@ -386,6 +471,7 @@ before a flexible slot has been selected.
         logger.info("job_resolution_ms=%.1f", (time.perf_counter() - stage_started) * 1000)
         if error is not None:
             return error
+        self._announce_progress(context, "Let me quickly verify that slot for you.", "slot_validation")
         recheck = await db_tools.validate_selected_technician_for_booking(
             selected_technician, self.state.service_type or "", self.state.service_area or "",
             start, end, client=self.db_client,
@@ -402,6 +488,7 @@ before a flexible slot has been selected.
             selected_slot_id, selected_technician, self.state.scheduled_start, self.state.scheduled_end,
         )
         logger.info("booking_write_start job_id=%s technician_id=%s", job_id, selected_technician)
+        self._announce_progress(context, "Perfect. One moment while I get that booked.", "booking")
         appointment_started = time.perf_counter()
         booking = await db_tools.book_appointment(
             self.customer_id or "", job_id or "", selected_technician, start, end,
@@ -464,7 +551,7 @@ before a flexible slot has been selected.
             selected["technician_id"], selected["start"], selected["end"],
         )
         selection_started = time.perf_counter()
-        finalized = await self._finalize_selected_slot()
+        finalized = await self._finalize_selected_slot(context)
         logger.info("select_available_slot_duration_ms=%.1f", (time.perf_counter() - selection_started) * 1000)
         if not finalized.ok:
             self.state.booking_status = "failed"
@@ -680,6 +767,8 @@ before a flexible slot has been selected.
         guard = self._normal_workflow_guard()
         if guard is not None:
             raise ToolError(guard.error or "Normal workflow is unavailable")
+        self._announce_progress(context, "Let me quickly verify that slot for you.", "slot_validation")
+        tool_started = time.perf_counter()
         try:
             result = await db_tools.check_technician_availability(
                 technician_id,
@@ -689,6 +778,7 @@ before a flexible slot has been selected.
             )
         except ValueError as exc:
             raise ToolError(str(exc)) from exc
+        logger.info("tool_end operation=slot_validation tool_duration_ms=%.1f", (time.perf_counter() - tool_started) * 1000)
         if not result.ok:
             raise ToolError(result.error or "Technician availability could not be checked")
         return _json(_result(result))
@@ -766,6 +856,8 @@ before a flexible slot has been selected.
         """Book only after customer context, availability, and job are valid."""
         if context is not None:
             context.disallow_interruptions()
+        self._announce_progress(context, "Perfect. One moment while I get that booked.", "booking")
+        tool_started = time.perf_counter()
         result = await self._book_appointment(
             service_type=service_type,
             service_area=service_area,
@@ -774,6 +866,7 @@ before a flexible slot has been selected.
             scheduled_end=scheduled_end,
             notes=notes or None,
         )
+        logger.info("tool_end operation=booking tool_duration_ms=%.1f", (time.perf_counter() - tool_started) * 1000)
         if not result.ok:
             raise ToolError(result.error or "The appointment could not be booked")
         return _json(_result(result))
@@ -816,7 +909,10 @@ before a flexible slot has been selected.
         """Move an existing appointment after the database validates availability."""
         if context is not None:
             context.disallow_interruptions()
+        self._announce_progress(context, "One moment while I update that appointment.", "reschedule")
+        tool_started = time.perf_counter()
         result = await self._reschedule_appointment(appointment_id, scheduled_start, scheduled_end)
+        logger.info("tool_end operation=reschedule tool_duration_ms=%.1f", (time.perf_counter() - tool_started) * 1000)
         if not result.ok:
             raise ToolError(result.error or "The appointment could not be rescheduled")
         return _json(_result(result))
@@ -848,7 +944,10 @@ before a flexible slot has been selected.
         """Cancel an existing appointment only after the database confirms it exists."""
         if context is not None:
             context.disallow_interruptions()
+        self._announce_progress(context, "Sure, give me a moment while I cancel that.", "cancellation")
+        tool_started = time.perf_counter()
         result = await self._cancel_appointment(appointment_id)
+        logger.info("tool_end operation=cancellation tool_duration_ms=%.1f", (time.perf_counter() - tool_started) * 1000)
         if not result.ok:
             raise ToolError(result.error or "The appointment could not be cancelled")
         return _json(_result(result))
