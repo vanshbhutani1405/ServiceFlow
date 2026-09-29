@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -239,10 +240,11 @@ async def find_best_technician(
         db = _client(client)
         technicians = await _many(db.from_("technicians").select("*").eq("status", "active"))
         requested_area = _area_key(service_area)
+        requested_type = _service_key(service_type)
         candidates = [
             tech for tech in technicians
             if requested_area in {_area_key(str(area)) for area in (tech.get("service_areas") or [])}
-            and service_type.casefold() in {str(skill).casefold() for skill in (tech.get("skills") or [])}
+            and requested_type in {_service_key(str(skill)) for skill in (tech.get("skills") or [])}
         ]
         available = []
         for technician in candidates:
@@ -263,6 +265,16 @@ def _parse_db_datetime(value: Any) -> datetime:
 
 def _area_key(value: str) -> str:
     return value.casefold().replace(" ", "_").replace("-", "_")
+
+
+def _service_key(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", value.casefold().replace("-", " ").replace("_", " ")).strip()
+    return {
+        "ac repair": "hvac",
+        "air conditioner repair": "hvac",
+        "air conditioning repair": "hvac",
+        "air conditioning": "hvac",
+    }.get(normalized, normalized)
 
 
 async def find_next_available_slots(
@@ -298,21 +310,46 @@ async def find_next_available_slots(
         ]
         duration = timedelta(minutes=service_duration_minutes)
         area = _area_key(service_area)
-        skill = service_type.casefold().strip()
+        skill = _service_key(service_type)
+        counters = {
+            "technicians_considered": len(technicians), "availability_windows": 0,
+            "candidate_slots_generated": 0, "rejected_past": 0, "rejected_duration": 0,
+            "rejected_service_type": 0, "rejected_service_area": 0,
+            "rejected_conflict": 0, "valid_slots": 0,
+        }
+        rejection_logs = 0
+
+        def reject(reason: str, **details: Any) -> None:
+            nonlocal rejection_logs
+            counters[f"rejected_{reason}"] += 1
+            if rejection_logs < 5:
+                logger.info("availability_rejection reason=%s details=%s", reason, details)
+                rejection_logs += 1
         slots: list[dict[str, Any]] = []
 
         for technician in technicians:
             tech_areas = {_area_key(str(item)) for item in (technician.get("service_areas") or [])}
             tech_skills = {str(item).casefold() for item in (technician.get("skills") or [])}
-            if area not in tech_areas or skill not in tech_skills:
+            if skill not in tech_skills:
+                reject("service_type", technician_id=technician.get("id"), requested=skill)
+                continue
+            if area not in tech_areas:
+                reject("service_area", technician_id=technician.get("id"), requested=area)
                 continue
             windows = [
                 row for row in availability
                 if row.get("technician_id") == technician.get("id")
             ]
             for window in windows:
+                counters["availability_windows"] += 1
                 window_start = max(_parse_db_datetime(window["available_start"]), start)
                 window_end = min(_parse_db_datetime(window["available_end"]), horizon_end)
+                if window_end <= start:
+                    reject("past", technician_id=technician.get("id"), window=window.get("available_start"))
+                    continue
+                if window_end - window_start < duration:
+                    reject("duration", technician_id=technician.get("id"), duration_minutes=service_duration_minutes)
+                    continue
                 candidate = window_start.replace(second=0, microsecond=0)
                 minute = ((candidate.minute + 29) // 30) * 30
                 if minute >= 60:
@@ -331,6 +368,7 @@ async def find_next_available_slots(
                         candidate += timedelta(minutes=30)
                         continue
                     conflict = False
+                    counters["candidate_slots_generated"] += 1
                     for appointment in blocking:
                         if appointment["technician_id"] != technician.get("id"):
                             continue
@@ -338,6 +376,7 @@ async def find_next_available_slots(
                         existing_end = _parse_db_datetime(appointment["scheduled_end"])
                         if existing_start < candidate_end and existing_end > candidate:
                             conflict = True
+                            reject("conflict", technician_id=technician.get("id"), start=candidate.isoformat())
                             logger.info(
                                 "availability_conflict technician_id=%s start=%s end=%s",
                                 technician.get("id"), candidate.isoformat(), candidate_end.isoformat(),
@@ -351,6 +390,7 @@ async def find_next_available_slots(
                             "technician_id": technician["id"],
                         }
                         slots.append(slot)
+                        counters["valid_slots"] += 1
                         logger.info(
                             "availability_candidate technician_id=%s start=%s end=%s",
                             technician["id"], slot["start"], slot["end"],
@@ -360,8 +400,8 @@ async def find_next_available_slots(
         slots = slots[:5]
         status = "success" if slots else "unavailable"
         logger.info(
-            "availability_search status=%s mode=FLEXIBLE horizon=%s slots_found=%s",
-            status, search_horizon_days, len(slots),
+            "availability_search status=%s mode=FLEXIBLE horizon=%s slots_found=%s counters=%s",
+            status, search_horizon_days, len(slots), counters,
         )
         return ToolResult(status, {"slots": slots, "search_horizon_days": search_horizon_days},
                           None if slots else "No eligible technician slots were found")
@@ -494,7 +534,7 @@ async def match_technician_for_job(
         customer = await _one(db, "customers", job["customer_id"])
         if not customer:
             return ToolResult("not_found", error="Customer not found")
-        requested_type = (service_type or job.get("service_type") or "").casefold()
+        requested_type = _service_key(service_type or job.get("service_type") or "")
         requested_area = _area_key(service_area or customer.get("service_area") or "")
         if not requested_type or not requested_area:
             return ToolResult("failure", error="Job service type and customer service area are required")

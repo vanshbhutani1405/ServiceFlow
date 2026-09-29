@@ -171,6 +171,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
 
 def run() -> None:
+    for noisy_logger in ("httpx", "httpcore", "hpack", "h2"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",

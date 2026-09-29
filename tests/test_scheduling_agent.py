@@ -7,7 +7,7 @@ import pytest
 pytest.importorskip("livekit.agents")
 
 from agent.agents.scheduling_agent import SchedulingAgent
-from agent.agents.scheduling_agent import _normalize_datetime
+from agent.agents.scheduling_agent import _effective_service_duration, _normalize_datetime
 from agent.state import WorkflowState
 from db import tools as db_tools
 
@@ -107,6 +107,12 @@ def test_datetime_normalization_accepts_supported_iso_values(start, end):
 def test_datetime_normalization_rejects_invalid_value():
     with pytest.raises(ValueError):
         _normalize_datetime("tomorrow afternoon")
+
+
+def test_ac_repair_duration_is_deterministic_when_llm_requests_240_minutes():
+    assert _effective_service_duration("AC Repair", 240, "AC is not cooling") == 60
+    assert _effective_service_duration("AC Repair", 90, "AC is not cooling") == 90
+    assert _effective_service_duration("AC Repair", 240, "Please allow 4 hours") == 240
 
 
 def test_record_intake_merges_phone_fragments_and_preserves_valid_value():

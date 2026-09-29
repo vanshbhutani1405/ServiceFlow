@@ -19,6 +19,7 @@ from db.tools import (
     get_job_status,
     reschedule_appointment,
 )
+from db.seed import APPOINTMENTS, TECHNICIANS
 
 
 CUSTOMER_ID = "customer-1"
@@ -190,6 +191,30 @@ def test_flexible_search_returns_unavailable_without_matching_technician():
     result = run(find_next_available_slots("sf", "electrical", search_start=START, client=FakeClient()))
     assert result.status == "unavailable"
     assert result.data["slots"] == []
+
+
+def test_seeded_ac_repair_flexible_search_returns_real_slot_and_counters(caplog):
+    client = FakeClient()
+    client.tables["technicians"] = deepcopy(TECHNICIANS)
+    client.tables["appointments"] = deepcopy(APPOINTMENTS)
+    client.tables["technician_availability"] = [
+        {"id": "availability-1", "technician_id": TECHNICIANS[0]["id"],
+         "available_start": "2026-10-01T09:00:00+00:00", "available_end": "2026-10-01T17:00:00+00:00", "status": "available"},
+        {"id": "availability-2", "technician_id": TECHNICIANS[1]["id"],
+         "available_start": "2026-10-01T10:00:00+00:00", "available_end": "2026-10-01T18:00:00+00:00", "status": "available"},
+        {"id": "availability-3", "technician_id": TECHNICIANS[3]["id"],
+         "available_start": "2026-10-02T12:00:00+00:00", "available_end": "2026-10-02T18:00:00+00:00", "status": "available"},
+    ]
+    caplog.set_level("INFO", logger="db.tools")
+    result = run(find_next_available_slots(
+        "San Francisco", "AC Repair", service_duration_minutes=60,
+        search_start=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        search_horizon_days=7, client=client,
+    ))
+    assert result.ok
+    assert result.data["slots"]
+    assert all(slot["technician_id"] in {tech["id"] for tech in TECHNICIANS} for slot in result.data["slots"])
+    assert "counters=" in caplog.text
 
 
 def test_dispatch_rejects_wrong_customer():

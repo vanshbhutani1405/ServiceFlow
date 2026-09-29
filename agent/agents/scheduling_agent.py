@@ -72,6 +72,17 @@ def _merge_phone(existing: str | None, incoming: str) -> str:
     return normalized
 
 
+def _effective_service_duration(service_type: str, requested: int, description: str | None) -> int:
+    """Keep V1 duration deterministic; only an explicit customer duration overrides it."""
+    normalized = service_type.casefold().replace("_", " ").replace("-", " ")
+    if normalized.strip() not in {"ac repair", "air conditioner repair", "air conditioning repair", "hvac"}:
+        return requested
+    explicit = bool(re.search(r"\b\d+\s*(?:minutes?|mins?|hours?|hrs?)\b", description or "", re.IGNORECASE))
+    if explicit or requested in {60, 90}:
+        return requested
+    return 60
+
+
 class SchedulingAgent(Agent):
     """Focused receptionist for booking, rescheduling, and cancellation."""
 
@@ -285,6 +296,18 @@ synchronously and wait for its actual result before reporting assignment.
         if not self.state.service_type or not self.state.service_area:
             raise ToolError("Please provide the service type and service area before checking availability")
         try:
+            requested_duration = int(service_duration_minutes)
+        except (TypeError, ValueError) as exc:
+            raise ToolError("Service duration must be a valid number of minutes") from exc
+        duration = _effective_service_duration(
+            self.state.service_type, requested_duration, self.state.description,
+        )
+        if duration != requested_duration:
+            logger.info(
+                "availability_duration normalized service_type=%s requested_minutes=%s effective_minutes=%s",
+                self.state.service_type, requested_duration, duration,
+            )
+        try:
             start = _parse_time(search_start) if search_start else datetime.now(timezone.utc)
         except ValueError as exc:
             raise ToolError(f"Invalid availability search start: {exc}") from exc
@@ -292,7 +315,7 @@ synchronously and wait for its actual result before reporting assignment.
         self.state.workflow_stage = "CHECKING_AVAILABILITY"
         result = await db_tools.find_next_available_slots(
             self.state.service_area, self.state.service_type,
-            service_duration_minutes=service_duration_minutes,
+            service_duration_minutes=duration,
             search_start=start, search_horizon_days=search_horizon_days,
             client=self.db_client,
         )
