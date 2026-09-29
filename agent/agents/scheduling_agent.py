@@ -139,7 +139,9 @@ Never invent an appointment, technician, slot, ID, or database state. A tool
 result is authoritative. Only tell the customer an operation succeeded when
 the tool result has status "success". For "unavailable", "not_found", or
 "failure", explain the issue naturally and ask for clarification or another
-request as appropriate. Never expose internal tool names or statuses.
+request as appropriate. Never expose internal tool names, statuses, database
+details, backend reasoning, recovery steps, or phrases such as "technical
+glitch", "self-correction", or "I will attempt to".
 
 For a new booking, collect service type, service area, requested date/time,
 full customer name, phone, and then the full street address before handing off a new
@@ -206,6 +208,8 @@ before a flexible slot has been selected.
         if context is not None:
             self._bind_state(context)
             context.disallow_interruptions()
+        if self.state.booking_status == "dispatched" and self.state.workflow_stage == "COMPLETE":
+            raise ToolError("This appointment has already been completed")
         if (
             self.state.active_workflow == SchedulingIntent.BOOK.value
             and self.state.availability_mode == "FLEXIBLE"
@@ -343,6 +347,9 @@ before a flexible slot has been selected.
             if normalized_window in _TIME_WINDOWS:
                 self.state.requested_time_window = normalized_window
                 self.state.requested_window_start, self.state.requested_window_end = _TIME_WINDOWS[normalized_window]
+                self.state.availability_mode = "FLEXIBLE"
+        if requested_date:
+            self.state.availability_mode = "FLEXIBLE"
         next_field = self.state.next_missing_field()
         return _json({
             "status": "success", "next_field": next_field,

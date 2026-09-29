@@ -20,6 +20,7 @@ from livekit.plugins import silero
 
 from agent.agents.scheduling_agent import SchedulingAgent
 from agent.state import WorkflowState
+from db.supabase_client import get_supabase_client
 
 load_dotenv()
 
@@ -56,6 +57,15 @@ def _log_session_metrics(session: AgentSession) -> None:
 
 
 server = AgentServer()
+_db_client: Any = None
+
+
+def _prewarm_db_client() -> Any:
+    """Create the cached Supabase client before the realtime session starts."""
+    global _db_client
+    if _db_client is None:
+        _db_client = get_supabase_client()
+    return _db_client
 
 
 @server.rtc_session()
@@ -83,6 +93,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         )
 
     workflow_state = WorkflowState(customer_id=os.getenv("SERVICEFLOW_CUSTOMER_ID") or None)
+    db_client = _db_client or get_supabase_client()
     session = AgentSession(
         userdata=workflow_state,
         vad=vad,
@@ -152,7 +163,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     ctx.add_shutdown_callback(on_session_end)
 
-    agent = SchedulingAgent(customer_id=workflow_state.customer_id, state=workflow_state)
+    agent = SchedulingAgent(
+        customer_id=workflow_state.customer_id, state=workflow_state, db_client=db_client,
+    )
     await session.start(
         agent=agent,
         room=ctx.room,
@@ -171,6 +184,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
 
 def run() -> None:
+    _prewarm_db_client()
     for noisy_logger in ("httpx", "httpcore", "hpack", "h2"):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
     logging.basicConfig(

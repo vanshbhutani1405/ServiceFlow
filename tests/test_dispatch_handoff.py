@@ -76,6 +76,18 @@ def test_record_intake_asks_one_next_question_and_skips_supplied_fields():
     assert "time window" in result["question"]
 
 
+def test_flexible_record_intake_cannot_dispatch_before_slot_selection():
+    agent = make_agent()
+    state = WorkflowState(
+        active_workflow="BOOK", availability_mode="FLEXIBLE", requested_date="2026-09-30",
+    )
+    with pytest.raises(ToolError, match="Select an available appointment slot"):
+        run(agent.transfer_to_dispatch(
+            ToolContext(state), "", "2026-09-30T08:00:00+00:00", "2026-09-30T09:00:00+00:00",
+            service_type="hvac", service_area="sf",
+        ))
+
+
 def test_record_intake_full_name_updates_canonical_userdata():
     state = WorkflowState()
     agent = make_agent()
@@ -273,6 +285,22 @@ def test_select_available_slot_accepts_only_backend_candidate(monkeypatch):
     assert state.scheduled_start.endswith("13:00:00+00:00")
     with pytest.raises(ToolError):
         run(agent.select_available_slot(ToolContext(state), slot_id="invented"))
+
+
+def test_completed_canonical_selection_rejects_redundant_dispatch_transfer(monkeypatch):
+    agent = make_agent()
+    agent.state = WorkflowState(
+        active_workflow="BOOK", availability_mode="FLEXIBLE",
+        booking_status="dispatched", workflow_stage="COMPLETE",
+        customer_id="customer-1", job_id=JOB_ID,
+    )
+
+    async def unexpected_dispatch(*_args, **_kwargs):
+        raise AssertionError("dispatch must not run after canonical finalization")
+
+    monkeypatch.setattr(db_tools, "dispatch_job", unexpected_dispatch)
+    with pytest.raises(ToolError, match="already been completed"):
+        run(agent.transfer_to_dispatch(None, JOB_ID))
 
 
 def test_selected_flexible_slot_flows_into_dispatch(monkeypatch):
