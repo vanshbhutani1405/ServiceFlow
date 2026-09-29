@@ -223,10 +223,13 @@ def test_transfer_syncs_tool_name_and_completes_canonical_workflow(monkeypatch):
     assert calls == ["customer", "job", ("dispatch", JOB_ID)]
 
 
-def test_select_available_slot_accepts_only_backend_candidate():
+def test_select_available_slot_accepts_only_backend_candidate(monkeypatch):
     agent = make_agent()
     state = WorkflowState(
-        service_type="hvac", service_area="sf",
+        customer_id="customer-1", full_name="Maya Chen", phone="4155550100",
+        service_type="hvac", service_area="sf", address="1 Main Street",
+        description="AC repair",
+        job_id=JOB_ID,
         candidate_slots=[{
             "slot_id": "tech-1:2026-10-01T10:00:00+00:00",
             "start": "2026-10-01T10:00:00+00:00",
@@ -235,8 +238,29 @@ def test_select_available_slot_accepts_only_backend_candidate():
         }],
     )
     agent.state = state
+    async def context(_self):
+        return db_tools.ToolResult("success", {
+            "customer": {"id": "customer-1", "full_name": "Maya Chen", "phone": "4155550100"},
+            "jobs": [{"id": JOB_ID, "customer_id": "customer-1"}], "appointments": [],
+        })
+    async def get_job(_job_id, **_kwargs):
+        return db_tools.ToolResult("success", {"id": JOB_ID, "customer_id": "customer-1"})
+    async def available(*_args, **_kwargs):
+        return db_tools.ToolResult("success", {"available": True})
+    async def matching(*_args, **_kwargs):
+        return db_tools.ToolResult("success", {"technician": {"id": "tech-1"}})
+    async def booked(*_args, **_kwargs):
+        return db_tools.ToolResult("success", {"id": "appointment-1", "job_id": JOB_ID})
+    async def dispatched(*_args, **_kwargs):
+        return db_tools.ToolResult("success", {"job": {"id": JOB_ID, "technician_id": "tech-1"}})
+    monkeypatch.setattr(SchedulingAgent, "_get_customer_context", context)
+    monkeypatch.setattr(db_tools, "get_job", get_job)
+    monkeypatch.setattr(db_tools, "check_technician_availability", available)
+    monkeypatch.setattr(db_tools, "match_technician_for_job", matching)
+    monkeypatch.setattr(db_tools, "book_appointment", booked)
+    monkeypatch.setattr(db_tools, "dispatch_job", dispatched)
     selected = json.loads(run(agent.select_available_slot(
-        ToolContext(state), slot_id="tech-1:2026-10-01T10:00:00+00:00"
+        ToolContext(state), slot_id="tech-1:2026-10-01T10:00:00+00:00", technician_id="stale-tech"
     )))
     assert selected["status"] == "success"
     assert state.selected_technician_id == "tech-1"
@@ -274,10 +298,43 @@ def test_selected_flexible_slot_flows_into_dispatch(monkeypatch):
     monkeypatch.setattr(SchedulingAgent, "_get_customer_context", context)
     monkeypatch.setattr(db_tools, "get_job", get_job)
     monkeypatch.setattr(db_tools, "dispatch_job", dispatch)
+    async def matching(*_args, **_kwargs):
+        return db_tools.ToolResult("success", {"technician": {"id": "tech-1"}})
+    monkeypatch.setattr(db_tools, "match_technician_for_job", matching)
     result = json.loads(run(agent.transfer_to_dispatch(ToolContext(state), JOB_ID)))
     assert result["status"] == "success"
     assert captured["job_id"] == JOB_ID
     assert captured["technician_id"] == "tech-1"
+
+
+def test_selected_slot_recheck_rejects_slot_that_becomes_unavailable(monkeypatch):
+    agent = make_agent()
+    state = WorkflowState(
+        customer_id="customer-1", full_name="Maya Chen", phone="4155550100",
+        service_type="hvac", service_area="sf", address="1 Main Street",
+        description="AC repair", job_id=JOB_ID,
+        candidate_slots=[{
+            "slot_id": "tech-1:2026-10-01T10:00:00+00:00",
+            "start": "2026-10-01T10:00:00+00:00", "end": "2026-10-01T11:00:00+00:00",
+            "technician_id": "tech-1",
+        }],
+    )
+    agent.state = state
+    async def context(_self):
+        return db_tools.ToolResult("success", {
+            "customer": {"full_name": "Maya Chen", "phone": "4155550100"},
+            "jobs": [{"id": JOB_ID}], "appointments": [],
+        })
+    async def get_job(_job_id, **_kwargs):
+        return db_tools.ToolResult("success", {"id": JOB_ID, "customer_id": "customer-1"})
+    async def unavailable(*_args, **_kwargs):
+        return db_tools.ToolResult("unavailable", error="Slot is no longer available")
+    monkeypatch.setattr(SchedulingAgent, "_get_customer_context", context)
+    monkeypatch.setattr(db_tools, "get_job", get_job)
+    monkeypatch.setattr(db_tools, "check_technician_availability", unavailable)
+    with pytest.raises(ToolError, match="Slot is no longer available"):
+        run(agent.select_available_slot(ToolContext(state), slot_id=state.candidate_slots[0]["slot_id"]))
+    assert state.booking_status == "failed"
 
 
 def test_job_creation_failure_prevents_dispatch(monkeypatch):

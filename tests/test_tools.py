@@ -175,6 +175,15 @@ def test_dispatch_retry_reuses_persisted_assignment():
     assert result.data["job"]["technician_id"] == TECHNICIAN_ID
 
 
+def test_duplicate_booking_retry_reuses_existing_appointment():
+    client = FakeClient()
+    first = run(book_appointment(CUSTOMER_ID, JOB_ID, TECHNICIAN_ID, START, END, client=client))
+    second = run(book_appointment(CUSTOMER_ID, JOB_ID, TECHNICIAN_ID, START, END, client=client))
+    assert first.ok and second.ok
+    assert second.data["id"] == first.data["id"]
+    assert len(client.tables["appointments"]) == 1
+
+
 def test_flexible_search_returns_real_slots_from_availability_and_skips_conflicts():
     client = FakeClient(conflict=True)
     result = run(find_next_available_slots(

@@ -428,6 +428,19 @@ async def book_appointment(
             return ToolResult("not_found", error="Job not found")
         if job.get("customer_id") != customer_id:
             return ToolResult("failure", error="Job does not belong to customer")
+        existing = await _many(
+            db.from_("appointments")
+            .select("*")
+            .eq("customer_id", customer_id)
+            .eq("job_id", job_id)
+            .eq("technician_id", technician_id)
+            .eq("scheduled_start", scheduled_start.isoformat())
+            .eq("scheduled_end", scheduled_end.isoformat())
+            .in_("status", ["requested", "confirmed", "rescheduled", "dispatched"])
+        )
+        if existing:
+            logger.info("appointment status=existing appointment_id=%s job_id=%s", existing[0].get("id"), job_id)
+            return ToolResult("success", existing[0])
         availability = await check_technician_availability(technician_id, scheduled_start, scheduled_end, client=db)
         if not availability.ok:
             return availability

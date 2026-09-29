@@ -17,6 +17,7 @@ class WorkflowState:
     scheduled_start: str | None = None
     scheduled_end: str | None = None
     job_id: str | None = None
+    appointment_id: str | None = None
     booking_status: str = "not_started"
     dispatch_status: str = "not_started"
     active_workflow: str | None = None
