@@ -15,6 +15,7 @@ from db.tools import (
     dispatch_job,
     create_job,
     find_next_available_slots,
+    validate_selected_technician_for_booking,
     resolve_or_create_customer,
     get_job_status,
     reschedule_appointment,
@@ -184,6 +185,27 @@ def test_duplicate_booking_retry_reuses_existing_appointment():
     assert len(client.tables["appointments"]) == 1
 
 
+def test_selected_technician_validation_never_substitutes_another_technician():
+    result = run(validate_selected_technician_for_booking(
+        TECHNICIAN_ID, "AC Repair", "sf", START, END, client=FakeClient(),
+    ))
+    assert result.ok
+    assert result.data["technician"]["id"] == TECHNICIAN_ID
+
+
+def test_selected_technician_validation_reports_service_and_conflict_reasons():
+    mismatch = run(validate_selected_technician_for_booking(
+        TECHNICIAN_ID, "electrical", "sf", START, END, client=FakeClient(),
+    ))
+    assert mismatch.status == "failure"
+    assert mismatch.data["reason"] == "service_type_mismatch"
+    conflict = run(validate_selected_technician_for_booking(
+        TECHNICIAN_ID, "hvac", "sf", START, END, client=FakeClient(conflict=True),
+    ))
+    assert conflict.status == "unavailable"
+    assert conflict.data["reason"] == "appointment_conflict"
+
+
 def test_flexible_search_returns_real_slots_from_availability_and_skips_conflicts():
     client = FakeClient(conflict=True)
     result = run(find_next_available_slots(
@@ -207,21 +229,27 @@ def test_seeded_ac_repair_flexible_search_returns_real_slot_and_counters(caplog)
     client.tables["technicians"] = deepcopy(TECHNICIANS)
     client.tables["appointments"] = deepcopy(APPOINTMENTS)
     client.tables["technician_availability"] = [
-        {"id": "availability-1", "technician_id": TECHNICIANS[0]["id"],
+        {"id": "availability-1", "technician_id": TECHNICIANS[1]["id"],
+         "available_start": "2026-09-30T13:00:00+00:00", "available_end": "2026-09-30T17:00:00+00:00", "status": "available"},
+        {"id": "availability-2", "technician_id": TECHNICIANS[0]["id"],
          "available_start": "2026-10-01T09:00:00+00:00", "available_end": "2026-10-01T17:00:00+00:00", "status": "available"},
-        {"id": "availability-2", "technician_id": TECHNICIANS[1]["id"],
-         "available_start": "2026-10-01T10:00:00+00:00", "available_end": "2026-10-01T18:00:00+00:00", "status": "available"},
         {"id": "availability-3", "technician_id": TECHNICIANS[3]["id"],
          "available_start": "2026-10-02T12:00:00+00:00", "available_end": "2026-10-02T18:00:00+00:00", "status": "available"},
     ]
     caplog.set_level("INFO", logger="db.tools")
     result = run(find_next_available_slots(
         "San Francisco", "AC Repair", service_duration_minutes=60,
-        search_start=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        search_start=datetime(2026, 9, 30, tzinfo=timezone.utc),
         search_horizon_days=7, client=client,
     ))
     assert result.ok
     assert result.data["slots"]
+    assert any(
+        slot["technician_id"] == TECHNICIANS[1]["id"]
+        and slot["start"] == "2026-09-30T13:00:00+00:00"
+        and slot["end"] == "2026-09-30T14:00:00+00:00"
+        for slot in result.data["slots"]
+    )
     assert all(slot["technician_id"] in {tech["id"] for tech in TECHNICIANS} for slot in result.data["slots"])
     assert "counters=" in caplog.text
 

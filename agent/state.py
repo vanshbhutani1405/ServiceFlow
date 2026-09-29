@@ -24,7 +24,10 @@ class WorkflowState:
     workflow_stage: str = "INTAKE"
     availability_mode: str = "EXACT"
     candidate_slots: list[dict] | None = None
+    selected_slot_id: str | None = None
     selected_technician_id: str | None = None
+    selected_scheduled_start: str | None = None
+    selected_scheduled_end: str | None = None
 
     def next_missing_field(self) -> str | None:
         ordered = (

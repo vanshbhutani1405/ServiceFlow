@@ -388,6 +388,9 @@ async def find_next_available_slots(
                             "start": candidate.isoformat(),
                             "end": candidate_end.isoformat(),
                             "technician_id": technician["id"],
+                            "normalized_service_type": skill,
+                            "service_area": area,
+                            "duration_minutes": service_duration_minutes,
                         }
                         slots.append(slot)
                         counters["valid_slots"] += 1
@@ -417,6 +420,7 @@ async def book_appointment(
     scheduled_end: datetime,
     *,
     notes: str | None = None,
+    validated_slot: bool = False,
     client: Client | None = None,
 ) -> ToolResult:
     try:
@@ -441,9 +445,10 @@ async def book_appointment(
         if existing:
             logger.info("appointment status=existing appointment_id=%s job_id=%s", existing[0].get("id"), job_id)
             return ToolResult("success", existing[0])
-        availability = await check_technician_availability(technician_id, scheduled_start, scheduled_end, client=db)
-        if not availability.ok:
-            return availability
+        if not validated_slot:
+            availability = await check_technician_availability(technician_id, scheduled_start, scheduled_end, client=db)
+            if not availability.ok:
+                return availability
         appointment = await _execute_one(db.from_("appointments").insert({
             "customer_id": customer_id, "job_id": job_id, "technician_id": technician_id,
             "scheduled_start": scheduled_start.isoformat(), "scheduled_end": scheduled_end.isoformat(),
@@ -587,6 +592,39 @@ async def match_technician_for_job(
         return _failure("match_technician_for_job", exc)
 
 
+async def validate_selected_technician_for_booking(
+    technician_id: str,
+    service_type: str,
+    service_area: str,
+    scheduled_start: datetime,
+    scheduled_end: datetime,
+    *,
+    client: Client | None = None,
+) -> ToolResult:
+    """Validate one selected technician; never select or substitute another."""
+    try:
+        db = _client(client)
+        technician = await _one(db, "technicians", technician_id)
+        if technician is None:
+            return ToolResult("not_found", {"reason": "technician_not_found"}, "Technician not found")
+        if technician.get("status", "").casefold() != "active":
+            return ToolResult("failure", {"reason": "technician_inactive"}, "Selected technician is inactive")
+        normalized_type = _service_key(service_type)
+        if normalized_type not in {_service_key(str(skill)) for skill in (technician.get("skills") or ())}:
+            return ToolResult("failure", {"reason": "service_type_mismatch"}, "Selected technician does not support this service")
+        if _area_key(service_area) not in {_area_key(str(area)) for area in (technician.get("service_areas") or ())}:
+            return ToolResult("failure", {"reason": "service_area_mismatch"}, "Selected technician does not cover this service area")
+        availability = await check_technician_availability(
+            technician_id, scheduled_start, scheduled_end, client=db,
+        )
+        if not availability.ok:
+            reason = "appointment_conflict" if availability.data and availability.data.get("conflicting_appointments") else "availability_invalidated"
+            return ToolResult(availability.status, {"reason": reason, "technician": technician}, availability.error)
+        return ToolResult("success", {"reason": "valid", "technician": technician})
+    except Exception as exc:
+        return _failure("validate_selected_technician_for_booking", exc)
+
+
 async def dispatch_job(
     job_id: str,
     *,
@@ -596,6 +634,7 @@ async def dispatch_job(
     scheduled_end: datetime | None = None,
     service_type: str | None = None,
     service_area: str | None = None,
+    validated_selected_technician: bool = False,
     client: Client | None = None,
 ) -> ToolResult:
     """Assign a job through deterministic matching and persist dispatch state."""
@@ -610,6 +649,13 @@ async def dispatch_job(
             technician = await _one(db, "technicians", job["technician_id"])
             if technician is None:
                 return ToolResult("failure", error="Dispatched job has no persisted technician record")
+            existing_appointments = await _many(db.from_("appointments").select("*").eq("job_id", job_id))
+            if any(
+                appointment.get("technician_id") != job["technician_id"]
+                or appointment.get("status") != "dispatched"
+                for appointment in existing_appointments
+            ):
+                return ToolResult("failure", error="Persisted appointment assignment does not match the job")
             logger.info("dispatch status=existing job_id=%s technician_id=%s", job_id, job["technician_id"])
             return ToolResult("success", {
                 "job": job, "technician": technician, "explanation": ["Existing dispatch reused"],
@@ -622,16 +668,31 @@ async def dispatch_job(
             scheduled_end = datetime.fromisoformat(str(appointment["scheduled_end"]).replace("Z", "+00:00"))
         if scheduled_start is None or scheduled_end is None:
             return ToolResult("failure", error="A scheduled appointment window is required for dispatch")
-        match = await match_technician_for_job(
-            job_id, scheduled_start, scheduled_end, customer_id=customer_id,
-            service_type=service_type, service_area=service_area, client=db,
-        )
-        if not match.ok:
-            return match
-        selected = match.data["technician"]
-        if technician_id is not None and technician_id != selected["id"]:
-            return ToolResult("unavailable", data=match.data, error="Requested technician is not the deterministic match")
-        technician_id = selected["id"]
+        if technician_id is not None:
+            if validated_selected_technician:
+                selected = await _one(db, "technicians", technician_id)
+                if selected is None:
+                    return ToolResult("not_found", error="Selected technician not found")
+                explanation = ["Selected technician already validated"]
+            else:
+                validation = await validate_selected_technician_for_booking(
+                    technician_id, service_type or job.get("service_type") or "",
+                    service_area or "", scheduled_start, scheduled_end, client=db,
+                )
+                if not validation.ok:
+                    return validation
+                selected = validation.data["technician"]
+                explanation = ["Selected technician revalidated"]
+        else:
+            match = await match_technician_for_job(
+                job_id, scheduled_start, scheduled_end, customer_id=customer_id,
+                service_type=service_type, service_area=service_area, client=db,
+            )
+            if not match.ok:
+                return match
+            selected = match.data["technician"]
+            explanation = match.data["explanation"]
+            technician_id = selected["id"]
         patch = {"status": "dispatched", "technician_id": technician_id}
         updated_job = await _execute_one(db.from_("jobs").update(patch).eq("id", job_id).select("*"))
         if not updated_job or updated_job.get("id") != job_id or updated_job.get("technician_id") != technician_id:
@@ -639,19 +700,25 @@ async def dispatch_job(
             return ToolResult("failure", error="Technician assignment was not persisted")
         logger.info("technician_assignment status=success job_id=%s technician_id=%s", job_id, technician_id)
         if appointment:
-            await _execute(db.from_("appointments").update({
+            updated_appointment = await _execute_one(db.from_("appointments").update({
                 "technician_id": technician_id, "status": "dispatched",
-            }).eq("id", appointment["id"]))
+            }).eq("id", appointment["id"]).select("*"))
+            if (
+                not updated_appointment
+                or updated_appointment.get("technician_id") != technician_id
+                or updated_appointment.get("status") != "dispatched"
+            ):
+                return ToolResult("failure", error="Appointment technician assignment was not persisted")
             await _execute(db.from_("appointment_events").insert({
                 "appointment_id": appointment["id"], "event_type": "dispatched",
-                "metadata": {"technician_id": technician_id, "explanation": match.data["explanation"]},
+                "metadata": {"technician_id": technician_id, "explanation": explanation},
             }))
         await _execute(db.from_("tool_executions").insert({
             "tool_name": "dispatch_job", "status": "success",
             "input": {"job_id": job_id, "technician_id": technician_id},
             "output": updated_job,
         }))
-        return ToolResult("success", {"job": updated_job, "technician": selected, "explanation": match.data["explanation"]})
+        return ToolResult("success", {"job": updated_job, "technician": selected, "explanation": explanation})
     except Exception as exc:
         return _failure("dispatch_job", exc)
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -338,7 +339,19 @@ before a flexible slot has been selected.
     async def _finalize_selected_slot(self) -> db_tools.ToolResult:
         """Recheck and persist a selected backend slot without another LLM call."""
         selected_technician = self.state.selected_technician_id
-        if not selected_technician or not self.state.scheduled_start or not self.state.scheduled_end:
+        selected_slot_id = self.state.selected_slot_id
+        candidate = next((slot for slot in (self.state.candidate_slots or []) if slot.get("slot_id") == selected_slot_id), None)
+        if candidate is None:
+            return db_tools.ToolResult("failure", error="Selected slot is not a canonical availability candidate")
+        if (
+            candidate.get("technician_id") != selected_technician
+            or candidate.get("start") != self.state.selected_scheduled_start
+            or candidate.get("end") != self.state.selected_scheduled_end
+        ):
+            return db_tools.ToolResult("failure", error="Selected slot state is inconsistent with its backend candidate")
+        self.state.scheduled_start = self.state.selected_scheduled_start
+        self.state.scheduled_end = self.state.selected_scheduled_end
+        if not selected_technician or not self.state.selected_scheduled_start or not self.state.selected_scheduled_end:
             return db_tools.ToolResult("failure", error="A valid selected appointment slot is required")
         if self.state.booking_status == "dispatched" and self.state.job_id:
             current = await db_tools.get_job_status(
@@ -351,6 +364,7 @@ before a flexible slot has been selected.
                     "technician_id": selected_technician,
                     "reused": True,
                 })
+        stage_started = time.perf_counter()
         try:
             start = _parse_time(self.state.scheduled_start)
             end = _parse_time(self.state.scheduled_end)
@@ -361,6 +375,7 @@ before a flexible slot has been selected.
             scheduled_start=self.state.scheduled_start, scheduled_end=self.state.scheduled_end,
             address=self.state.address or "", full_name=self.state.full_name or "", phone=self.state.phone or "",
         )
+        logger.info("customer_resolution_ms=%.1f", (time.perf_counter() - stage_started) * 1000)
         if not validation.ok:
             return validation
         job_id, error = await self._resolve_dispatch_job_id(
@@ -368,48 +383,55 @@ before a flexible slot has been selected.
             service_area=self.state.service_area or "", address=self.state.address or "",
             description=self.state.description or "",
         )
+        logger.info("job_resolution_ms=%.1f", (time.perf_counter() - stage_started) * 1000)
         if error is not None:
             return error
-        recheck = await db_tools.check_technician_availability(
-            selected_technician, start, end, client=self.db_client,
+        recheck = await db_tools.validate_selected_technician_for_booking(
+            selected_technician, self.state.service_type or "", self.state.service_area or "",
+            start, end, client=self.db_client,
         )
+        logger.info("slot_revalidation_ms=%.1f", (time.perf_counter() - stage_started) * 1000)
         if not recheck.ok:
             self.state.workflow_stage = "CHECKING_AVAILABILITY"
             return recheck
-        matching = await db_tools.match_technician_for_job(
-            job_id or "", start, end, customer_id=self.customer_id,
-            service_type=self.state.service_type, service_area=self.state.service_area,
-            client=self.db_client,
+        selected = (recheck.data or {}).get("technician") or {}
+        if selected.get("id") != selected_technician:
+            return db_tools.ToolResult("failure", error="Selected technician verification failed")
+        logger.info(
+            "booking_validation_result status=success slot_id=%s technician_id=%s start=%s end=%s",
+            selected_slot_id, selected_technician, self.state.scheduled_start, self.state.scheduled_end,
         )
-        matched = (matching.data or {}).get("technician") if matching.data else None
-        if not matching.ok or not matched or matched.get("id") != selected_technician:
-            return db_tools.ToolResult(
-                "unavailable" if matching.status == "unavailable" else "failure",
-                error=matching.error or "The selected technician is no longer eligible for this slot",
-            )
+        logger.info("booking_write_start job_id=%s technician_id=%s", job_id, selected_technician)
+        appointment_started = time.perf_counter()
         booking = await db_tools.book_appointment(
             self.customer_id or "", job_id or "", selected_technician, start, end,
-            notes="Selected from database-backed availability", client=self.db_client,
+            notes="Selected from database-backed availability", validated_slot=True, client=self.db_client,
         )
+        logger.info("appointment_persistence_ms=%.1f", (time.perf_counter() - appointment_started) * 1000)
         if not booking.ok:
             return booking
         self.state.appointment_id = booking.data.get("id")
         self.state.job_id = job_id
         self.state.workflow_stage = "DISPATCHING"
+        dispatch_started = time.perf_counter()
         dispatch = await db_tools.dispatch_job(
             job_id or "", technician_id=selected_technician, customer_id=self.customer_id,
             scheduled_start=start, scheduled_end=end,
             service_type=self.state.service_type, service_area=self.state.service_area,
+            validated_selected_technician=True,
             client=self.db_client,
         )
+        logger.info("dispatch_persistence_ms=%.1f", (time.perf_counter() - dispatch_started) * 1000)
         if not dispatch.ok:
             return dispatch
         persisted_job = (dispatch.data or {}).get("job") or {}
+        logger.info("verification_ms=%.1f", (time.perf_counter() - dispatch_started) * 1000)
         if persisted_job.get("technician_id") != selected_technician:
             return db_tools.ToolResult("failure", error="Technician assignment verification failed")
         self.state.booking_status = "dispatched"
         self.state.dispatch_status = "success"
         self.state.workflow_stage = "COMPLETE"
+        logger.info("total_finalization_ms=%.1f", (time.perf_counter() - stage_started) * 1000)
         return db_tools.ToolResult("success", {
             "appointment": booking.data, "dispatch": dispatch.data,
         })
@@ -423,25 +445,27 @@ before a flexible slot has been selected.
         self._bind_state(context)
         if context is not None:
             context.disallow_interruptions()
+        if not slot_id:
+            raise ToolError("Select an available slot by its backend slot ID")
         slots = self.state.candidate_slots or []
         selected = next((slot for slot in slots if slot.get("slot_id") == slot_id), None)
-        if selected is None and scheduled_start and scheduled_end and technician_id:
-            selected = next((slot for slot in slots if (
-                slot.get("start") == scheduled_start and slot.get("end") == scheduled_end
-                and slot.get("technician_id") == technician_id
-            )), None)
         if selected is None:
             raise ToolError("Please choose one of the available appointment options")
         self.state.scheduled_start = selected["start"]
         self.state.scheduled_end = selected["end"]
+        self.state.selected_slot_id = selected["slot_id"]
         self.state.selected_technician_id = selected["technician_id"]
+        self.state.selected_scheduled_start = selected["start"]
+        self.state.selected_scheduled_end = selected["end"]
         self.state.availability_mode = "FLEXIBLE"
         self.state.workflow_stage = "DISPATCHING"
         logger.info(
             "availability_selection status=success technician_id=%s start=%s end=%s",
             selected["technician_id"], selected["start"], selected["end"],
         )
+        selection_started = time.perf_counter()
         finalized = await self._finalize_selected_slot()
+        logger.info("select_available_slot_duration_ms=%.1f", (time.perf_counter() - selection_started) * 1000)
         if not finalized.ok:
             self.state.booking_status = "failed"
             raise ToolError(finalized.error or "The selected appointment could not be booked")

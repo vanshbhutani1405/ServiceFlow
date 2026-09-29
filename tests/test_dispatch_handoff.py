@@ -231,10 +231,10 @@ def test_select_available_slot_accepts_only_backend_candidate(monkeypatch):
         description="AC repair",
         job_id=JOB_ID,
         candidate_slots=[{
-            "slot_id": "tech-1:2026-10-01T10:00:00+00:00",
-            "start": "2026-10-01T10:00:00+00:00",
-            "end": "2026-10-01T11:00:00+00:00",
-            "technician_id": "tech-1",
+            "slot_id": "00000000-0000-0000-0000-000000000202:2026-09-30T13:00:00+00:00",
+            "start": "2026-09-30T13:00:00+00:00",
+            "end": "2026-09-30T14:00:00+00:00",
+            "technician_id": "00000000-0000-0000-0000-000000000202",
         }],
     )
     agent.state = state
@@ -247,24 +247,30 @@ def test_select_available_slot_accepts_only_backend_candidate(monkeypatch):
         return db_tools.ToolResult("success", {"id": JOB_ID, "customer_id": "customer-1"})
     async def available(*_args, **_kwargs):
         return db_tools.ToolResult("success", {"available": True})
-    async def matching(*_args, **_kwargs):
-        return db_tools.ToolResult("success", {"technician": {"id": "tech-1"}})
+    async def validation(*_args, **_kwargs):
+        return db_tools.ToolResult("success", {"technician": {"id": "00000000-0000-0000-0000-000000000202"}})
     async def booked(*_args, **_kwargs):
         return db_tools.ToolResult("success", {"id": "appointment-1", "job_id": JOB_ID})
     async def dispatched(*_args, **_kwargs):
-        return db_tools.ToolResult("success", {"job": {"id": JOB_ID, "technician_id": "tech-1"}})
+        return db_tools.ToolResult("success", {"job": {"id": JOB_ID, "technician_id": "00000000-0000-0000-0000-000000000202"}})
     monkeypatch.setattr(SchedulingAgent, "_get_customer_context", context)
     monkeypatch.setattr(db_tools, "get_job", get_job)
     monkeypatch.setattr(db_tools, "check_technician_availability", available)
-    monkeypatch.setattr(db_tools, "match_technician_for_job", matching)
+    monkeypatch.setattr(db_tools, "validate_selected_technician_for_booking", validation)
+    async def forbidden_match(*_args, **_kwargs):
+        raise AssertionError("generic technician matching must not run after slot selection")
+    monkeypatch.setattr(db_tools, "match_technician_for_job", forbidden_match)
     monkeypatch.setattr(db_tools, "book_appointment", booked)
     monkeypatch.setattr(db_tools, "dispatch_job", dispatched)
     selected = json.loads(run(agent.select_available_slot(
-        ToolContext(state), slot_id="tech-1:2026-10-01T10:00:00+00:00", technician_id="stale-tech"
+        ToolContext(state), slot_id="00000000-0000-0000-0000-000000000202:2026-09-30T13:00:00+00:00", technician_id="stale-tech"
     )))
     assert selected["status"] == "success"
-    assert state.selected_technician_id == "tech-1"
-    assert state.scheduled_start.endswith("10:00:00+00:00")
+    assert state.selected_technician_id == "00000000-0000-0000-0000-000000000202"
+    assert state.selected_slot_id == "00000000-0000-0000-0000-000000000202:2026-09-30T13:00:00+00:00"
+    assert state.selected_scheduled_start == "2026-09-30T13:00:00+00:00"
+    assert state.selected_scheduled_end == "2026-09-30T14:00:00+00:00"
+    assert state.scheduled_start.endswith("13:00:00+00:00")
     with pytest.raises(ToolError):
         run(agent.select_available_slot(ToolContext(state), slot_id="invented"))
 
@@ -331,7 +337,7 @@ def test_selected_slot_recheck_rejects_slot_that_becomes_unavailable(monkeypatch
         return db_tools.ToolResult("unavailable", error="Slot is no longer available")
     monkeypatch.setattr(SchedulingAgent, "_get_customer_context", context)
     monkeypatch.setattr(db_tools, "get_job", get_job)
-    monkeypatch.setattr(db_tools, "check_technician_availability", unavailable)
+    monkeypatch.setattr(db_tools, "validate_selected_technician_for_booking", unavailable)
     with pytest.raises(ToolError, match="Slot is no longer available"):
         run(agent.select_available_slot(ToolContext(state), slot_id=state.candidate_slots[0]["slot_id"]))
     assert state.booking_status == "failed"
