@@ -51,7 +51,6 @@ Every technician match, every available slot, every booking confirmation comes f
 <div align="center">
 
 <a href="https://youtu.be/2RT9L7zd2Nw" target="_blank">
-  <img src="https://img.youtube.com/vi/2RT9L7zd2Nw/maxresdefault.jpg" alt="ServiceFlow demo video" width="760">
 </a>
 
 **[▶ Watch on YouTube](https://youtu.be/2RT9L7zd2Nw)** — a full call from first "hello" to a dispatched technician, no edits.
@@ -204,8 +203,6 @@ The model never generates the final technician, the appointment ID, or the booki
 | Orchestration | LiveKit Agents + typed workflow state |
 | Database | Supabase PostgreSQL |
 | Backend tools | Async Python |
-| Frontend | React |
-| Deployment | Azure |
 
 ---
 
