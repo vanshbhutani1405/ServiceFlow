@@ -166,6 +166,45 @@ def test_customer_intake_progresses_name_then_phone_then_address():
     assert '"next_field": null' in address
 
 
+def test_spoken_number_address_survives_intake_and_final_validation(monkeypatch):
+    agent = make_agent()
+    agent.customer_id = None
+    agent.state = WorkflowState()
+    address = "One five nine Market Street, San Francisco"
+
+    result = run(agent.record_intake(None, address=address))
+
+    assert '"status": "success"' in result
+    assert agent.state.address == address
+
+    async def resolve_customer(*_args, **_kwargs):
+        return db_tools.ToolResult("success", {"customer": {"id": "customer-real"}})
+
+    monkeypatch.setattr(db_tools, "resolve_or_create_customer", resolve_customer)
+    validation = run(agent._validate_dispatch_prerequisites(
+        service_type="hvac", service_area="San Francisco",
+        scheduled_start="2026-10-01T13:00:00+00:00",
+        scheduled_end="2026-10-01T14:00:00+00:00",
+        address=agent.state.address, full_name="Vansh", phone="4155550100",
+    ))
+
+    assert validation.ok
+    assert agent.state.address == address
+
+
+def test_missing_address_returns_one_deterministic_validation_failure():
+    agent = make_agent()
+    result = run(agent._validate_dispatch_prerequisites(
+        service_type="hvac", service_area="San Francisco",
+        scheduled_start="2026-10-01T13:00:00+00:00",
+        scheduled_end="2026-10-01T14:00:00+00:00",
+        address="", full_name="Vansh", phone="4155550100",
+    ))
+
+    assert result.status == "failure"
+    assert result.error == "Please provide your full street address."
+
+
 def test_flexible_search_passes_canonical_requested_date_and_window(monkeypatch):
     agent = make_agent()
     agent.state = WorkflowState(

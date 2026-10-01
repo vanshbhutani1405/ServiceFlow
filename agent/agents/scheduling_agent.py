@@ -596,7 +596,15 @@ before a flexible slot has been selected.
 
     @staticmethod
     def _valid_address(address: str) -> bool:
-        return bool(re.search(r"\b\d+[A-Za-z]?\s+[A-Za-z]", address.strip())) and len(address.split()) >= 3
+        parts = re.findall(r"[A-Za-z0-9]+", address.strip())
+        if len(parts) < 3:
+            return False
+        if re.fullmatch(r"\d+[A-Za-z]?", parts[0]):
+            return True
+        index = 0
+        while index < len(parts) and parts[index].casefold() in _PHONE_WORDS:
+            index += 1
+        return index > 0 and index < len(parts) and bool(re.fullmatch(r"[A-Za-z]+", parts[index]))
 
     async def _validate_dispatch_prerequisites(
         self, *, service_type: str, service_area: str, scheduled_start: str,
